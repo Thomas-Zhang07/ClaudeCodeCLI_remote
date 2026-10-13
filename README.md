@@ -25,16 +25,19 @@ a mainland-China mobile network — hence Gitee rather than GitHub.
 ```
 PC                                                                     Gitee (private repo)
 ┌────────────────────────────────────────────────────────┐        ┌─────────────────────────┐
-│  ccr ── node-pty ──▶ claude  (TUI preserved;           │        │  out/index.json         │
-│                     stdin owned ⇒ prompts injectable)  │ push ▶ │  out/sessions/<id>/     │
-│                                                        │        │    state.json           │
-│  bridge                                                │        │    events-NNNN.jsonl    │
-│    registry ─ sessions/<pid>.json  (liveness, status)  │ ◀ poll │    subagents.json       │
-│    tail     ─ streaming, byte offset, per-file         │        │  in/<id>/<ts>.json      │
-│    state    ─ last-wins types → state.json             │        └─────────────────────────┘
-│    events   ─ chat text + edits + subagent metadata    │                   ▲   │
-│    sync     ─ chunk writer, coalesced push, backoff    │       Contents API  │   │ PUT
-│    inbound  ─ fetch → verify HMAC → inject or reject   │        (CORS ✓)     │   ▼
+│  ccr ── node-pty ──▶ claude  (TUI preserved;           │        │  relay-out (rewritten)  │
+│                     stdin owned ⇒ prompts injectable)  │ push ▶ │  out/index.json         │
+│                                                        │        │  out/sessions/<id>/     │
+│  bridge                                                │        │    state.json           │
+│    registry ─ sessions/<pid>.json  (liveness, status)  │ ◀ poll │    events-NNNN.jsonl    │
+│    tail     ─ streaming, byte offset, per-file         │        │    subagents.json       │
+│    state    ─ last-wins types → state.json             │        ├─────────────────────────┤
+│    events   ─ chat text + edits + subagent metadata    │        │  relay-in (append-only) │
+│    sync     ─ chunk writer, amended push, backoff      │        │  in/<id>/<ts>.json      │
+│    inbound  ─ fetch → verify HMAC → inject or reject   │        └─────────────────────────┘
+│                                                        │                   ▲   │
+└────────────────────────────────────────────────────────┘       Contents API  │   │ PUT
+                                                                  (CORS ✓)     │   ▼
 └────────────────────────────────────────────────────────┘        ┌─────────────────────────┐
                                                                   │  Phone PWA              │
    plain `claude` sessions: registry-known, read-only             │  Vite + TypeScript      │
@@ -129,9 +132,17 @@ Copy `.env.example` to `.env` and fill it in. The bridge reads:
 |---|---|
 | `CCR_REPO_URL` | Git URL of the private relay repo |
 | `CCR_REPO_TOKEN` | Gitee token used for pushing |
-| `CCR_BRANCH` | Branch to publish to (default `relay`) |
+| `CCR_OUT_BRANCH` | Branch the bridge publishes to (default `relay-out`) |
+| `CCR_IN_BRANCH` | Branch the phone writes prompts to (default `relay-in`) |
 | `CCR_SECRET` | Shared secret for signing injected prompts |
 | `CCR_STATE_DIR` | Where tail offsets and chunk state are persisted |
+
+**Why two branches.** Outbound data is rewritten — each publish amends a single
+commit and force-pushes, so the repository does not accumulate a commit every few
+seconds. Inbound data is append-only and never rewritten. If they shared a
+branch, compacting the outbound side would destroy a prompt the phone had written
+but the bridge had not yet fetched, and it would vanish with no error. Keeping
+them apart is what makes compaction safe rather than merely unlikely to hurt.
 
 `.env` is gitignored. Never commit the token.
 
