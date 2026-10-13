@@ -1,0 +1,26 @@
+{
+  "name": "claude-code-cli-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Monitor and drive a Claude Code CLI session from your phone, with a git repo as the transport",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/shared",
+    "packages/bridge"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "bridge": "npm run start --workspace @ccr/bridge",
+    "ccr": "npm run ccr --workspace @ccr/bridge",
+    "phone:dev": "npm run dev --prefix packages/phone",
+    "phone:build": "npm run build --prefix packages/phone"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

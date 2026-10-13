@@ -1,0 +1,16 @@
+# Normalise line endings in the repository to LF.
+#
+# This project is developed on Windows but deployed to Linux hosts (Netlify,
+# and any relay that shells out to git), so pinning LF keeps checkouts identical
+# everywhere and stops git warning about conversion on every add.
+* text=auto eol=lf
+
+# Generated or vendored content that must not be re-encoded.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Keep lockfiles out of diff review noise.
+package-lock.json -diff linguist-generated
