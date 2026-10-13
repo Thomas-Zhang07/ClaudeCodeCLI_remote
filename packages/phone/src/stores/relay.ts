@@ -1,30 +1,46 @@
 /**
  * The application store.
  *
- * One poll cycle is deliberately cheap in the steady state: fetch the head of
- * `relay-out`, compare it with the sha we last saw, and stop. Content is only
- * fetched for blobs whose sha changed, and chunks only for the session actually
- * on screen — the manifest is what makes that possible without walking files.
+ * The relay is read as two small JSON files plus numbered chunks, never as a
+ * file listing: `out/index.json` is the session list, each session's
+ * `head.json` carries its status and its chunk range, and `sessions/<id>/` holds
+ * immutable `events-NNNN.jsonl` chunks fetched by number. Knowing the range is
+ * what makes a listing unnecessary — a listing grew with every chunk ever
+ * written, while a range is two integers however much history exists.
+ *
+ * A poll cycle is deliberately cheap. The list is polled slowly and only while
+ * it is on screen; an open session polls just its head. Chunks are requested
+ * only for numbers we do not already hold, a few at a time, because a phone that
+ * slept through a long run is missing many at once and requesting them together
+ * is what trips a `429`. Polling stops outright while the tab is hidden: Gitee
+ * charges quota even for a `304`, so a background poll is never free.
  */
 
 import { computed, reactive } from 'vue';
 
 import { blobCache } from '@/lib/cache';
 import { encodeBase64Text, utf8Bytes } from '@/lib/encoding';
-import { assembleStream, findManifestBreak, findMissingChunks, parseChunk, summarize } from '@/lib/events';
+import { assembleStream, parseChunk, summarize } from '@/lib/events';
 import type { Assembled, LoadedChunk, TimelineMeta } from '@/lib/events';
 import { pathSafeTimestamp } from '@/lib/format';
-import { GiteeError, IN_BRANCH, OUT_BRANCH, gitee, throttle, type ApiFailure } from '@/lib/gitee';
+import {
+  GiteeError,
+  IN_BRANCH,
+  OUT_BRANCH,
+  gitee,
+  throttle,
+  type ApiFailure,
+  type FileResult,
+} from '@/lib/gitee';
 import { newPromptId, randomSuffix, signPrompt } from '@/lib/hmac';
 import { canSign, isConfigured, settings } from '@/lib/settings';
 import { getJSON, setJSON } from '@/lib/storage';
 import type {
-  ChunkManifest,
   NormalizedEvent,
   OutboundPrompt,
   RelayIndex,
+  SessionHead,
   SessionIndexEntry,
-  SessionState,
   SubagentNode,
 } from '@/types';
 
@@ -36,41 +52,99 @@ const ERROR_BACKOFF_CAP_MS = 120_000;
 const OUTBOUND_KEY = 'ccr.outbound.v1';
 const OUTBOUND_PER_SESSION = 20;
 
-export type GapReason = 'chunk-incomplete' | 'missing-chunk' | 'manifest-break' | 'sequence-gap';
+/**
+ * The session list rarely changes and is only read while browsing, so it is
+ * polled slowly. An open session's head is ~200 B and is polled at the user's
+ * chosen interval while that session is working, and slowly otherwise.
+ */
+const LIST_POLL_MS = 60_000;
+const IDLE_DETAIL_POLL_MS = 60_000;
+
+/** Chunks fetched in one pass before deferring the rest to the next poll. */
+const MAX_CHUNKS_PER_PASS = 5;
+/** A gap between chunk fetches, so a catch-up never fires as a burst. */
+const CHUNK_FETCH_GAP_MS = 250;
+/** Gitee's Contents API lags the branch ref by seconds, so a 404 is retried. */
+const CHUNK_404_ATTEMPTS = 2;
+const CHUNK_404_RETRY_MS = 2_500;
+/** Polls a chunk may stay unfetchable before we stop calling it "in flight". */
+const STUCK_POLLS = 3;
+/** Refetches of a torn chunk before we give up and report the hole. */
+const RESYNC_ATTEMPTS = 2;
+
+export type GapReason = 'chunk-incomplete' | 'sequence-gap';
+
+/**
+ * Why chunk loading stopped short.
+ *
+ * The distinction matters because the four cases look identical from the
+ * outside and deserve very different reactions: two are entirely normal, one is
+ * a stall worth surfacing, and only the last is damage.
+ */
+type BlockKind =
+  /** The newest chunk has no sentinel yet — the writer is still appending. */
+  | 'unsealed'
+  /** We hit the per-pass fetch cap; the rest waits for the next poll. */
+  | 'deferred'
+  /** A 404 that survived the lag retry. In flight, but worth watching. */
+  | 'unavailable'
+  /** Torn or self-inconsistent. Refetched, then reported as a hole. */
+  | 'malformed';
+
+interface Blocked {
+  n: number;
+  kind: BlockKind;
+}
 
 export interface DetailState {
   sessionId: string;
   loading: boolean;
   error: string | null;
   errorKind: ApiFailure | null;
-  state: SessionState | null;
-  manifest: ChunkManifest | null;
+  head: SessionHead | null;
   subagents: SubagentNode[];
+  /** False until the forest has been fetched once, so the first load fetches it. */
+  subagentsLoaded: boolean;
   events: NormalizedEvent[];
   summary: TimelineMeta;
+  /**
+   * Earlier history was dropped by the relay's rolling retention. Not a fault,
+   * and deliberately distinct from `gap`: nothing is broken, the window is just
+   * bounded.
+   */
+  pruned: { droppedEvents: number } | null;
   /** True while a fetch failed and a retry could still repair the stream. */
   resyncing: boolean;
   /**
-   * A hole we cannot repair by refetching — the manifest itself is
-   * discontinuous, or the sequence inside the loaded chunks jumps.
+   * A hole we cannot repair by refetching — the sequence inside the loaded
+   * chunks jumps.
    */
   gap: { afterSeq: number; reason: GapReason } | null;
+  /** Chunk numbers in the retained range that are not loaded yet. */
   pendingChunks: number[];
+  /**
+   * The newest chunk has not arrived or has not been sealed yet. Normal while a
+   * turn is streaming, so it is reported quietly rather than as a fault.
+   */
+  inFlight: boolean;
+  /** Consecutive polls the current blockage has persisted, to spot a real stall. */
+  blockedPolls: number;
   /** Chunk number from which content should be refetched, when resyncing. */
   resyncFrom: number | null;
   resyncAttempts: number;
   chunksLoaded: number;
+  /** Size of the retained range, so the UI can show progress. */
+  chunksTotal: number;
   lastLoadedAt: number;
 }
 
 export interface RelayState {
   index: RelayIndex | null;
   indexLoaded: boolean;
-  /** The branch exists (or the index is written) but carries no sessions. */
+  /** The index is published but carries no sessions. */
   empty: boolean;
-  states: Record<string, SessionState>;
-  branchSha: string | null;
-  treeTruncated: boolean;
+  /** Heads we have seen, for whichever sessions have been opened. */
+  heads: Record<string, SessionHead>;
   phase: 'idle' | 'loading' | 'ready' | 'error';
   error: string | null;
   errorKind: ApiFailure | null;
@@ -86,9 +160,7 @@ export const relay = reactive<RelayState>({
   index: null,
   indexLoaded: false,
   empty: false,
-  states: {},
-  branchSha: null,
-  treeTruncated: false,
+  heads: {},
   phase: 'idle',
   error: null,
   errorKind: null,
@@ -99,9 +171,6 @@ export const relay = reactive<RelayState>({
   detail: null,
   outbound: loadOutbound(),
 });
-
-/** path -> blob sha, from the last tree walk. */
-let treeIndex = new Map<string, string>();
 
 function loadOutbound(): Record<string, OutboundPrompt[]> {
   const raw = getJSON<Record<string, OutboundPrompt[]>>(OUTBOUND_KEY, {});
@@ -128,6 +197,11 @@ function parseJson<T>(text: string): T | null {
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** `events-` + the number zero-padded to four digits + `.jsonl`. */
 function chunkPath(sessionId: string, n: number): string {
   return `out/sessions/${sessionId}/events-${String(n).padStart(4, '0')}.jsonl`;
 }
@@ -146,18 +220,23 @@ export function outboundFor(sessionId: string | null): OutboundPrompt[] {
 // ---------------------------------------------------------------------------
 
 export interface SessionRow extends SessionIndexEntry {
-  /** state.json wins over index.json when both are present. */
-  detail: SessionState | null;
+  /**
+   * The head, when we happen to be holding one for this session.
+   *
+   * Only an opened session has one — the list is rendered from the index alone,
+   * deliberately: fetching a head per session would cost one request per row.
+   */
+  head: SessionHead | null;
 }
 
 export const sessions = computed<SessionRow[]>(() => {
   const index = relay.index;
   if (!index) return [];
   return index.sessions
-    .map((entry) => ({ ...entry, detail: relay.states[entry.sessionId] ?? null }))
+    .map((entry) => ({ ...entry, head: relay.heads[entry.sessionId] ?? null }))
     .sort((a, b) => {
-      const at = Date.parse(a.detail?.updatedAt ?? a.updatedAt) || 0;
-      const bt = Date.parse(b.detail?.updatedAt ?? b.updatedAt) || 0;
+      const at = Date.parse(a.head?.updatedAt ?? a.updatedAt) || 0;
+      const bt = Date.parse(b.head?.updatedAt ?? b.updatedAt) || 0;
       return bt - at;
     });
 });
@@ -180,25 +259,35 @@ function configureClient(): void {
 // request `/repos///…` and report a bogus 404.
 configureClient();
 
-/** Read a path through the blob cache, refetching when its sha has moved. */
-async function fetchPath(path: string, force = false): Promise<{ text: string; sha: string } | null> {
-  const known = treeIndex.get(path) ?? '';
-
-  if (!force && known !== '') {
-    const cached = blobCache.get(path, known);
-    if (cached !== null) return { text: cached, sha: known };
+/**
+ * Read one chunk, tolerating Gitee's Contents API lagging the branch ref.
+ *
+ * A chunk named in `head.json` can 404 for a few seconds after it is pushed,
+ * because the Contents API serves from a cache that trails the ref. That is in
+ * flight, not missing, so it is retried briefly rather than reported as a hole
+ * in the stream.
+ */
+async function readChunk(path: string): Promise<FileResult | null> {
+  for (let attempt = 0; attempt < CHUNK_404_ATTEMPTS; attempt++) {
+    const file = await gitee.readFile(path, OUT_BRANCH);
+    if (file !== null) return file;
+    if (attempt < CHUNK_404_ATTEMPTS - 1) await delay(CHUNK_404_RETRY_MS);
   }
-
-  const file = await gitee.readFile(path, OUT_BRANCH);
-  if (!file) return null;
-  const sha = file.sha || known;
-  blobCache.set(path, sha, file.text);
-  return { text: file.text, sha };
+  return null;
 }
 
+function rangeInclusive(from: number, to: number): number[] {
+  const out: number[] = [];
+  for (let n = from; n <= to; n++) out.push(n);
+  return out;
+}
+
+/** The session list. One small request, and it is only read while browsing. */
 async function refreshIndex(): Promise<void> {
-  const file = await fetchPath('out/index.json');
+  const file = await gitee.readFile('out/index.json', OUT_BRANCH);
   if (!file) {
+    // Nothing published yet (or no access to it). Not an error state: a relay
+    // that has never been used looks exactly like this.
     relay.index = null;
     relay.empty = true;
     relay.indexLoaded = true;
@@ -213,33 +302,6 @@ async function refreshIndex(): Promise<void> {
   relay.index = index;
   relay.empty = index.sessions.length === 0;
   relay.indexLoaded = true;
-}
-
-/**
- * Refresh `state.json` for the sessions we can see.
- *
- * Only the list, plus the open session, is kept fresh: a phone does not need the
- * cost of a hundred sessions it is not looking at, and every one of these is a
- * request against an API that will not tell us how much quota is left.
- */
-async function refreshStates(): Promise<void> {
-  const rows = relay.index?.sessions ?? [];
-  const wanted = relay.activeSessionId
-    ? rows.filter((row) => row.sessionId === relay.activeSessionId)
-    : rows;
-
-  for (const row of wanted) {
-    const path = `${sessionDir(row.sessionId)}/state.json`;
-    const known = treeIndex.get(path);
-    // Nothing in the tree means the session directory is gone; keep what we had.
-    if (known === undefined) continue;
-    if (blobCache.has(path, known) && row.sessionId !== relay.activeSessionId) continue;
-
-    const file = await fetchPath(path);
-    if (!file) continue;
-    const state = parseJson<SessionState>(file.text);
-    if (state) relay.states[row.sessionId] = state;
-  }
 }
 
 function handleFailure(error: unknown): void {
@@ -263,72 +325,35 @@ export async function pollOnce(options: { force?: boolean } = {}): Promise<void>
   configureClient();
 
   if (throttle.until > Date.now()) return;
-  if (!relay.indexLoaded) relay.phase = 'loading';
+
+  const detail = relay.activeSessionId !== null && relay.detail !== null ? relay.detail : null;
+  if (!relay.indexLoaded && detail === null) relay.phase = 'loading';
 
   try {
-    const head = await gitee.branchHead(OUT_BRANCH);
+    if (detail !== null) {
+      // A session is open: its head is the only thing polled. The index is left
+      // alone until the user goes back to the list, so watching one session
+      // never re-downloads the others.
+      await loadDetail({ forceMeta: options.force === true });
+      // Detail failures are handled inside the load so they can be shown against
+      // the session, but a rejected token has to reach the store as well or the
+      // redirect to Settings never fires while a session is on screen.
+      if (detail.errorKind === 'auth') {
+        throw new GiteeError('auth', detail.error ?? 'The access token was rejected.', 401);
+      }
+    } else {
+      await refreshIndex();
+    }
+
     relay.lastPollAt = Date.now();
-
-    if (head === null) {
-      // No branch yet: the PC has never published. Not an error state.
-      relay.branchSha = null;
-      relay.index = null;
-      relay.empty = true;
-      relay.indexLoaded = true;
-      relay.phase = 'ready';
-      relay.error = null;
-      relay.errorKind = null;
-      relay.consecutiveErrors = 0;
-      relay.lastSuccessAt = Date.now();
-      return;
-    }
-
-    // Steady state: one request, no content, done.
-    const unchanged = head === relay.branchSha && relay.indexLoaded && !options.force;
-    if (unchanged) {
-      const detail = relay.detail;
-      // A stream that is mid-resync may repair itself in place (a torn chunk is
-      // refetched from the cached tree), so it is worth retrying even when the
-      // branch has not moved.
-      const needsDetail =
-        relay.activeSessionId !== null &&
-        detail !== null &&
-        (detail.resyncing || detail.events.length === 0 || detail.manifest === null);
-
-      if (needsDetail) await loadDetail();
-
-      relay.phase = 'ready';
-      relay.error = null;
-      relay.errorKind = null;
-      relay.consecutiveErrors = 0;
-      relay.lastSuccessAt = Date.now();
-      return;
-    }
-
-    const tree = await gitee.tree(OUT_BRANCH);
-    relay.treeTruncated = tree.truncated;
-    treeIndex = new Map(
-      tree.entries
-        .filter((entry) => entry.type === 'blob')
-        .map((entry) => [entry.path, entry.sha] as const),
-    );
-    relay.branchSha = head;
-
-    await refreshIndex();
-    await refreshStates();
-    if (relay.activeSessionId) await loadDetail();
-
+    relay.lastSuccessAt = Date.now();
     relay.phase = 'ready';
     relay.error = null;
     relay.errorKind = null;
     relay.consecutiveErrors = 0;
-    relay.lastSuccessAt = Date.now();
   } catch (error) {
+    relay.lastPollAt = Date.now();
     handleFailure(error);
-    if (error instanceof GiteeError && error.failure === 'not-found') {
-      // The repository itself is missing: say so once, clearly.
-      relay.error = `Repository not found (${gitee.repoLabel}). Check the owner and repo name.`;
-    }
   }
 }
 
@@ -342,17 +367,21 @@ function createDetail(sessionId: string): DetailState {
     loading: false,
     error: null,
     errorKind: null,
-    state: relay.states[sessionId] ?? null,
-    manifest: null,
+    head: relay.heads[sessionId] ?? null,
     subagents: [],
+    subagentsLoaded: false,
     events: [],
     summary: summarize([]),
+    pruned: null,
     resyncing: false,
     gap: null,
     pendingChunks: [],
+    inFlight: false,
+    blockedPolls: 0,
     resyncFrom: null,
     resyncAttempts: 0,
     chunksLoaded: 0,
+    chunksTotal: 0,
     lastLoadedAt: 0,
   };
 }
@@ -375,6 +404,10 @@ let detailLoadInFlight: { sessionId: string | null; promise: Promise<void> } | n
 export function closeSession(): void {
   relay.activeSessionId = null;
   relay.detail = null;
+  // Back on the list, which may have gone stale while the session was open, and
+  // is not polled at all from the detail view. Refresh it now rather than after
+  // a whole slow-cadence interval.
+  schedule(0);
 }
 
 export async function refreshDetail(): Promise<void> {
@@ -382,7 +415,7 @@ export async function refreshDetail(): Promise<void> {
 }
 
 export interface LoadDetailOptions {
-  /** Refetch state/manifest/subagents even when the sha is unchanged. */
+  /** Refetch the subagent forest even when no new chunk arrived. */
   forceMeta?: boolean;
 }
 
@@ -399,6 +432,23 @@ function loadDetail(options: LoadDetailOptions = {}): Promise<void> {
   return promise;
 }
 
+/** Clear a detail that has nothing recorded yet. */
+function applyEmpty(detail: DetailState): void {
+  detail.events = [];
+  detail.summary = summarize([]);
+  detail.pruned = null;
+  detail.resyncing = false;
+  detail.gap = null;
+  detail.pendingChunks = [];
+  detail.inFlight = false;
+  detail.blockedPolls = 0;
+  detail.resyncFrom = null;
+  detail.resyncAttempts = 0;
+  detail.chunksLoaded = 0;
+  detail.chunksTotal = 0;
+  detail.lastLoadedAt = Date.now();
+}
+
 async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
   const sessionId = relay.activeSessionId;
   const detail = relay.detail;
@@ -409,109 +459,126 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
   detail.loading = true;
   detail.error = null;
   detail.errorKind = null;
-  const forceMeta = options.forceMeta === true;
 
   try {
-    const base = sessionDir(sessionId);
+    const dir = sessionDir(sessionId);
 
-    // --- state, manifest, subagents -------------------------------------
-    const stateFile = await fetchPath(`${base}/state.json`, forceMeta);
-    if (stateFile) {
-      const state = parseJson<SessionState>(stateFile.text);
-      if (state) {
-        detail.state = state;
-        relay.states[sessionId] = state;
-      }
-    } else if (detail.state === null) {
-      detail.error = 'This session has no state.json yet.';
+    // --- head.json: the one file polled while a session is open -----------
+    const headFile = await gitee.readFile(`${dir}/head.json`, OUT_BRANCH);
+    if (!headFile) {
+      // No published head. Keep whatever we already had rather than blanking
+      // the screen; only a first-ever open has nothing to show.
+      if (detail.head === null) detail.error = 'This session has no published data yet.';
+      return;
     }
 
-    const manifestFile = await fetchPath(`${base}/manifest.json`, forceMeta);
-    const manifest = manifestFile ? parseJson<ChunkManifest>(manifestFile.text) : null;
-    detail.manifest = manifest;
+    const head = parseJson<SessionHead>(headFile.text);
+    if (!head || typeof head.chunkFirst !== 'number' || typeof head.chunkLast !== 'number') {
+      throw new GiteeError('bad-response', 'head.json is not a session head.');
+    }
+    detail.head = head;
+    relay.heads[sessionId] = head;
 
-    const subagentsFile = await fetchPath(`${base}/subagents.json`, forceMeta);
-    if (subagentsFile) {
-      const parsed = parseJson<SubagentNode[]>(subagentsFile.text);
-      if (Array.isArray(parsed)) detail.subagents = parsed;
+    // --- an empty range means the session has recorded nothing ------------
+    if (head.chunkLast < head.chunkFirst) {
+      applyEmpty(detail);
+      return;
     }
 
-    // --- chunks ---------------------------------------------------------
-    const state = detail.state;
-    const declared = (manifest?.chunks ?? [])
-      .filter((entry) => typeof entry?.n === 'number')
-      .sort((a, b) => a.n - b.n);
-    // `chunkLast` is authoritative: it is only advanced once a chunk is sealed.
-    const chunkLast = state?.chunkLast ?? (declared.length > 0 ? declared[declared.length - 1]!.n : 0);
-    const sealed = declared.filter((entry) => entry.n <= chunkLast);
-
-    const pending = findMissingChunks(sealed);
-    const manifestBreak = findManifestBreak(sealed);
-
-    let collect = sealed;
-    let gap: DetailState['gap'] = null;
-
-    if (manifestBreak) {
-      // A break in the manifest cannot be repaired by refetching: the bridge
-      // simply does not have those events.
-      collect = sealed.filter((entry) => entry.n < manifestBreak.n);
-      const previous = sealed.filter((entry) => entry.n < manifestBreak.n).at(-1);
-      gap = { afterSeq: previous?.lastSeq ?? 0, reason: 'manifest-break' };
-    } else if (pending.length > 0) {
-      const firstMissing = pending[0]!;
-      collect = sealed.filter((entry) => entry.n < firstMissing);
-      const previous = collect.at(-1);
-      gap = { afterSeq: previous?.lastSeq ?? 0, reason: 'missing-chunk' };
-    }
-
+    // --- walk the retained range, fetching only what we do not hold -------
     const loaded: LoadedChunk[] = [];
-    let resyncing = false;
-    const unreadable: number[] = [];
-    let resyncFrom = detail.resyncFrom;
+    let fetchedNew = false;
+    let fetchedThisPass = 0;
+    let blocked: Blocked | null = null;
 
-    for (const entry of collect) {
-      const path = chunkPath(sessionId, entry.n);
-      const mustRefetch = resyncFrom !== null && entry.n >= resyncFrom;
-      // A sealed chunk is immutable, so its tree blob sha doubles as the cache
-      // key; `sha256` is the manifest's own digest of the same bytes.
-      const blobSha = treeIndex.get(path) ?? entry.sha256;
+    for (let n = head.chunkFirst; n <= head.chunkLast; n++) {
+      const path = chunkPath(sessionId, n);
+      const mustRefetch = detail.resyncFrom !== null && n >= detail.resyncFrom;
 
-      let text = mustRefetch ? null : blobCache.get(path, blobSha);
+      // A sealed chunk is immutable, so its path alone is a valid cache key;
+      // reusing one is the entire point of numbering chunks.
+      let text = mustRefetch ? null : blobCache.get(path, '');
+      let sha = '';
+      let justFetched = false;
 
       if (text === null) {
-        const file = await gitee.readFile(path, OUT_BRANCH);
-        if (!file) {
-          // The manifest advertises a chunk the repository does not have (yet).
-          resyncing = true;
-          unreadable.push(entry.n);
+        if (fetchedThisPass >= MAX_CHUNKS_PER_PASS) {
+          // Catch-up is deliberately gradual: a phone that slept through a long
+          // run is missing many chunks at once, and asking for them together is
+          // what trips a 429. The rest arrive on the following polls.
+          blocked = { n, kind: 'deferred' };
+          break;
+        }
+        if (fetchedThisPass > 0) await delay(CHUNK_FETCH_GAP_MS);
+
+        const file = await readChunk(path);
+        if (file === null) {
+          // 404 even after a retry: the Contents API has not caught up with the
+          // ref. In flight, not a hole.
+          blocked = { n, kind: 'unavailable' };
           break;
         }
         text = file.text;
-        blobCache.set(path, file.sha || blobSha, text);
+        sha = file.sha;
+        justFetched = true;
+        fetchedThisPass++;
       }
 
-      const parsed = parseChunk(text, entry);
+      const parsed = parseChunk(text, n);
       if (!parsed.ok) {
-        // A torn or inconsistent chunk: drop it, refetch it next time, and do
-        // not render anything after it — the sequence cannot be trusted.
-        resyncing = true;
-        unreadable.push(entry.n);
-        resyncFrom = resyncFrom === null ? entry.n : Math.min(resyncFrom, entry.n);
+        // No sentinel means the writer is still appending — the expected state
+        // of the newest chunk. Anything else is corruption.
+        blocked = { n, kind: parsed.incomplete ? 'unsealed' : 'malformed' };
         break;
       }
 
-      loaded.push({ entry, events: parsed.events });
+      // Cache only a complete, self-consistent chunk: a chunk without a
+      // sentinel will change, and the cache assumes chunks are immutable.
+      if (justFetched) {
+        blobCache.set(path, sha, text);
+        fetchedNew = true;
+      }
+      loaded.push({ n, events: parsed.events });
     }
 
-    if (unreadable.length === 0) {
-      // Everything read cleanly, so the previous forced refetch (if any) worked.
-      resyncFrom = null;
-    } else if (resyncFrom !== null && detail.resyncAttempts >= 2) {
-      // Two refetches have not fixed it. Report the hole rather than looping.
-      resyncing = false;
-      const previous = loaded.at(-1)?.entry;
-      gap = gap ?? { afterSeq: previous?.lastSeq ?? 0, reason: 'chunk-incomplete' };
-      resyncFrom = null;
+    // --- interpret what stopped us ----------------------------------------
+    let gap: DetailState['gap'] = null;
+    let resyncing = false;
+    let inFlight = false;
+    const lastLoadedSeq = loaded.at(-1)?.events.at(-1)?.seq ?? 0;
+
+    if (blocked !== null && blocked.kind === 'unavailable') {
+      detail.blockedPolls += 1;
+      inFlight = true;
+      // Gitee's lag is seconds, not polls. One that persists long enough to be
+      // noticed is reported as resyncing, never as a gap: a chunk that has not
+      // arrived is not the same as a discontinuity in the stream.
+      if (detail.blockedPolls >= STUCK_POLLS) resyncing = true;
+    } else if (blocked !== null && blocked.kind === 'malformed') {
+      detail.blockedPolls = 0;
+      if (detail.resyncAttempts >= RESYNC_ATTEMPTS) {
+        // Already given up on this hole. Keep reporting it without looping.
+        gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete' };
+      } else {
+        detail.resyncFrom =
+          detail.resyncFrom === null ? blocked.n : Math.min(detail.resyncFrom, blocked.n);
+        detail.resyncAttempts += 1;
+        if (detail.resyncAttempts >= RESYNC_ATTEMPTS) {
+          // A couple of refetches have not fixed it; report the hole rather than
+          // loop on it forever.
+          detail.resyncFrom = null;
+          gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete' };
+        } else {
+          resyncing = true;
+        }
+      }
+    } else {
+      // Fully loaded, or stopped only by something that heals itself: the
+      // writer still working on the newest chunk, or our own gradual catch-up.
+      detail.blockedPolls = 0;
+      detail.resyncAttempts = 0;
+      if (blocked === null) detail.resyncFrom = null;
+      inFlight = blocked !== null;
     }
 
     const assembled: Assembled = assembleStream(loaded);
@@ -519,22 +586,42 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       gap = { afterSeq: assembled.gapAfterSeq, reason: 'sequence-gap' };
     }
 
+    const pending = blocked === null ? [] : rangeInclusive(blocked.n, head.chunkLast);
+
     detail.events = assembled.events;
     detail.summary = summarize(assembled.events);
     detail.gap = gap;
     detail.resyncing = resyncing;
-    detail.pendingChunks = unreadable;
-    detail.resyncFrom = resyncFrom;
-    if (resyncing) detail.resyncAttempts += 1;
+    // A single outstanding chunk is the newest one, still unsealed — the steady
+    // state while a turn streams, and not worth announcing. More than one means
+    // a catch-up, which is visible to the reader and so is worth explaining.
+    detail.inFlight = inFlight && !resyncing && pending.length > 1;
+    detail.pendingChunks = pending;
     detail.chunksLoaded = loaded.length;
+    detail.chunksTotal = head.chunkLast - head.chunkFirst + 1;
+    detail.pruned =
+      head.chunkFirst > 1 || head.droppedEvents > 0 ? { droppedEvents: head.droppedEvents } : null;
     detail.lastLoadedAt = Date.now();
+
+    // --- the subagent forest ----------------------------------------------
+    // It only changes when events do, so it is fetched when a new chunk lands
+    // rather than on every poll.
+    if (options.forceMeta === true || fetchedNew || !detail.subagentsLoaded) {
+      const file = await gitee.readFile(`${dir}/subagents.json`, OUT_BRANCH);
+      if (file) {
+        const parsed = parseJson<SubagentNode[]>(file.text);
+        if (Array.isArray(parsed)) {
+          detail.subagents = parsed;
+          detail.subagentsLoaded = true;
+        }
+      }
+    }
 
     applyInjectionAcks(sessionId, assembled.events);
   } catch (error) {
     if (error instanceof GiteeError) {
       detail.error = error.message;
       detail.errorKind = error.failure;
-      if (error.failure === 'throttled') resyncingFallback(detail);
     } else {
       detail.error = error instanceof Error ? error.message : 'Failed to load this session.';
       detail.errorKind = 'bad-response';
@@ -542,10 +629,6 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
   } finally {
     detail.loading = false;
   }
-}
-
-function resyncingFallback(detail: DetailState): void {
-  if (detail.events.length === 0) detail.resyncing = true;
 }
 
 /** Fold `injection` events back onto the prompts we sent. */
@@ -584,7 +667,7 @@ export async function sendPrompt(text: string): Promise<SendOutcome> {
 
   const detail = relay.detail;
   if (!detail || detail.sessionId !== sessionId) return { ok: false, error: 'No session is open.' };
-  if (detail.state?.controllable === false) {
+  if (detail.head?.controllable === false) {
     return { ok: false, error: 'This session is read-only.' };
   }
   if (!isConfigured.value) return { ok: false, error: 'Configure the relay in Settings first.' };
@@ -653,8 +736,27 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let running = false;
 let started = false;
 
+/**
+ * How long to wait between polls, by what is on screen.
+ *
+ * The bridge publishes on turn boundaries rather than continuously, so polling
+ * faster than that mostly buys `304`s — which Gitee charges quota for anyway.
+ * A session that is not working has nothing new to say, so it drops to the slow
+ * cadence alongside the list.
+ */
+function currentCadenceMs(): number {
+  const detail = relay.detail;
+  if (relay.activeSessionId !== null && detail !== null) {
+    const status = detail.head?.status;
+    // An unknown status means we have not loaded a head yet, so keep trying at
+    // the lively cadence rather than sitting on the slow one.
+    return status === undefined || status === 'active' ? settings.pollMs : IDLE_DETAIL_POLL_MS;
+  }
+  return LIST_POLL_MS;
+}
+
 function nextDelay(): number {
-  const base = settings.pollMs;
+  const base = currentCadenceMs();
 
   if (relay.consecutiveErrors > 0) {
     // Exponential backoff on errors, capped so a flaky connection still heals.
@@ -669,6 +771,15 @@ function nextDelay(): number {
 
 function schedule(delay?: number): void {
   if (!started) return;
+  // A hidden tab is frozen on a phone, and Gitee charges for a `304` as surely
+  // as for a `200`, so a poll from the background is never worth making.
+  if (document.hidden) {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    return;
+  }
   if (timer !== null) {
     if (delay === undefined) return;
     clearTimeout(timer);
@@ -680,14 +791,9 @@ function schedule(delay?: number): void {
 }
 
 async function tick(): Promise<void> {
-  if (!started) return;
-  if (document.hidden) {
-    // Background tabs are frozen on a phone; polling would only burn quota.
-    schedule(settings.pollMs);
-    return;
-  }
+  if (!started || document.hidden) return;
   if (running) {
-    schedule(settings.pollMs);
+    schedule();
     return;
   }
 
@@ -702,6 +808,10 @@ async function tick(): Promise<void> {
 
 function onVisibilityChange(): void {
   if (document.hidden) {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
     blobCache.flush();
     return;
   }
@@ -746,12 +856,13 @@ export function onSettingsChanged(): void {
   throttle.attempts = 0;
   throttle.until = 0;
   throttle.active = false;
-  relay.branchSha = null;
+  relay.index = null;
   relay.indexLoaded = false;
+  relay.empty = false;
+  relay.heads = {};
   relay.error = null;
   relay.errorKind = null;
   relay.consecutiveErrors = 0;
-  treeIndex = new Map();
   if (relay.activeSessionId && relay.detail) {
     relay.detail = createDetail(relay.activeSessionId);
   }

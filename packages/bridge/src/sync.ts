@@ -18,7 +18,7 @@
  * working tree of the other.
  */
 
-import { cp, mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { authenticatedUrl, ensureClone, git, gitOrThrow } from './git.js';
@@ -123,9 +123,17 @@ export class RelaySync {
     for (let attempt = 0; attempt < MAX_PUSH_ATTEMPTS; attempt++) {
       await this.#fastForward(outCloneDir, outBranch);
 
-      // Mirror only `out/`, and additively: files absent locally are left alone,
-      // so nothing else in the tree can be removed by a publish.
-      await cp(outDir, join(outCloneDir, 'out'), { recursive: true, force: true });
+      // The outbound branch belongs entirely to the bridge, so the mirror is
+      // authoritative: whatever is not present locally is removed.
+      //
+      // Additive copying was the original behaviour and it is wrong. Files from
+      // a previous layout, a renamed session, or a pruned one would linger on
+      // the relay forever, and a reader would keep seeing them. Nothing else
+      // lives on this branch, so nothing else can be lost by clearing it.
+      const outSubtree = join(outCloneDir, 'out');
+      await rm(outSubtree, { recursive: true, force: true });
+      await cp(outDir, outSubtree, { recursive: true, force: true });
+
       await gitOrThrow(['add', '-A', '--', 'out'], { cwd: outCloneDir });
 
       const hasHead = (await git(['rev-parse', '--verify', 'HEAD'], { cwd: outCloneDir })).code === 0;

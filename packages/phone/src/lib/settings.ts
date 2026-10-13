@@ -17,12 +17,19 @@ export interface Settings {
   token: string;
   /** Shared with the PC as CCR_SECRET; keys the prompt HMAC. */
   secret: string;
-  /** Poll interval in ms. */
+  /**
+   * How often to poll the head of a session that is actively working.
+   *
+   * The session list and any session that is not working use a fixed slow
+   * cadence, because the bridge publishes on turn boundaries rather than
+   * continuously and a faster poll mostly returns `304`s — which Gitee charges
+   * quota for anyway.
+   */
   pollMs: number;
 }
 
-export const POLL_MIN_MS = 5_000;
-export const POLL_MAX_MS = 120_000;
+export const POLL_MIN_MS = 10_000;
+export const POLL_MAX_MS = 60_000;
 
 const KEY = 'ccr.settings.v1';
 
@@ -31,7 +38,7 @@ const DEFAULTS: Settings = {
   repo: '',
   token: '',
   secret: '',
-  pollMs: 10_000,
+  pollMs: 15_000,
 };
 
 function clampPoll(ms: number): number {

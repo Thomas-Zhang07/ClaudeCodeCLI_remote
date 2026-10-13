@@ -14,44 +14,42 @@ const now = useNow(15_000);
 
 const hasAny = computed(() => sessions.value.length > 0);
 
+// A row is rendered from the index alone. `row.head` is filled in only for a
+// session that has been opened, and is preferred when present because it is
+// strictly fresher — it costs no request either way.
 function title(row: SessionRow): string {
-  const fromState = row.detail?.title;
-  if (fromState) return fromState;
+  const fromHead = row.head?.title;
+  if (fromHead) return fromHead;
   if (row.title) return row.title;
   if (row.project) return basename(row.project);
   return row.sessionId.slice(0, 8);
 }
 
 function subtitle(row: SessionRow): string {
-  const project = row.detail?.project ?? row.project;
+  const project = row.head?.project ?? row.project;
   if (project) return project;
   return row.sessionId;
 }
 
 function status(row: SessionRow): SessionRow['status'] {
-  return row.detail?.status ?? row.status;
+  return row.head?.status ?? row.status;
 }
 
 function cost(row: SessionRow): number | undefined {
-  return row.detail?.cost?.totalCostUSD ?? row.costUSD;
+  return row.head?.cost?.totalCostUSD ?? row.costUSD;
 }
 
 function updatedAt(row: SessionRow): string {
-  return row.detail?.updatedAt ?? row.updatedAt;
+  return row.head?.updatedAt ?? row.updatedAt;
 }
 
 function controllable(row: SessionRow): boolean {
-  return row.detail?.controllable ?? row.controllable;
+  return row.head?.controllable ?? row.controllable;
 }
 </script>
 
 <template>
   <div class="list">
-    <p v-if="relay.treeTruncated" class="banner warn">
-      The repository tree came back truncated, so some sessions may be missing. Large relay
-      repositories should be trimmed on the PC.
-    </p>
-
     <p v-if="!hasAny" class="empty card">
       <template v-if="relay.indexLoaded">No sessions are being relayed yet.</template>
       <template v-else>Loading sessions…</template>
@@ -86,16 +84,6 @@ function controllable(row: SessionRow): boolean {
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-
-.banner {
-  margin: 0;
-  font-size: 13px;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid color-mix(in srgb, var(--wait) 45%, var(--border));
-  color: var(--wait);
-  background: color-mix(in srgb, var(--wait) 10%, transparent);
 }
 
 .empty {

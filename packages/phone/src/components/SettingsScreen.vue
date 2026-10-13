@@ -137,14 +137,15 @@ function clearCache(): void {
       </label>
 
       <label>
-        <span>Poll interval — {{ pollSeconds }}s</span>
+        <span>Active session poll interval — {{ pollSeconds }}s</span>
         <input v-model.number="pollSeconds" type="range" :min="POLL_MIN_MS / 1000" :max="POLL_MAX_MS / 1000" step="5" />
       </label>
 
       <p class="muted small">
-        Polling is skipped while the app is in the background and resumes the moment it comes back.
-        The steady-state cost is one request per poll; a 30s interval is a reasonable default on
-        mobile data.
+        This is how often the head of a session that is working is polled. The session list and any
+        idle session are polled every 60s, and polling stops entirely while the app is in the
+        background. The bridge publishes on turn boundaries, so faster polling mostly returns
+        unchanged files — which still cost Gitee quota.
       </p>
 
       <button class="btn btn-primary" type="button" :disabled="!dirty" @click="save">
@@ -170,8 +171,8 @@ function clearCache(): void {
           <dd>{{ relay.lastSuccessAt ? new Date(relay.lastSuccessAt).toLocaleTimeString() : 'never' }}</dd>
         </div>
         <div>
-          <dt>Branch head</dt>
-          <dd class="mono">{{ relay.branchSha ? relay.branchSha.slice(0, 8) : '—' }}</dd>
+          <dt>Last poll</dt>
+          <dd>{{ relay.lastPollAt ? new Date(relay.lastPollAt).toLocaleTimeString() : 'never' }}</dd>
         </div>
         <div>
           <dt>Cached files</dt>

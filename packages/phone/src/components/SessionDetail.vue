@@ -17,17 +17,22 @@ const emit = defineEmits<{ back: [] }>();
 const now = useNow(5_000);
 
 const detail = computed(() => (relay.detail?.sessionId === props.sessionId ? relay.detail : null));
-const state = computed(() => detail.value?.state ?? relay.states[props.sessionId] ?? null);
+
+/**
+ * The head is the session's own status file; the cached copy is a fallback for
+ * the moment before the first load resolves, and for after a failed one.
+ */
+const head = computed(() => detail.value?.head ?? relay.heads[props.sessionId] ?? null);
 
 const title = computed(() => {
-  const s = state.value;
-  if (s?.title) return s.title;
-  if (s?.project) return basename(s.project);
+  const h = head.value;
+  if (h?.title) return h.title;
+  if (h?.project) return basename(h.project);
   return props.sessionId.slice(0, 8);
 });
 
-const waiting = computed(() => state.value?.status === 'waiting');
-const controllable = computed(() => state.value?.controllable === true);
+const waiting = computed(() => head.value?.status === 'waiting');
+const controllable = computed(() => head.value?.controllable === true);
 
 const lastEventAt = computed(() => detail.value?.summary.lastEventTs ?? null);
 
@@ -54,18 +59,18 @@ function goBack(): void {
 
     <div class="title-row">
       <h1>{{ title }}</h1>
-      <StatusPill :status="state?.status ?? 'unknown'" />
+      <StatusPill :status="head?.status ?? 'unknown'" />
     </div>
     <p class="sub muted">
-      {{ state?.project ?? props.sessionId }}
-      <template v-if="state?.gitBranch"> · {{ state.gitBranch }}</template>
+      {{ head?.project ?? props.sessionId }}
+      <template v-if="head?.gitBranch"> · {{ head.gitBranch }}</template>
     </p>
 
     <!-- The "should I go back to my desk" signal: deliberately the loudest thing
          on the screen. -->
     <section v-if="waiting" class="attention-banner">
       <span class="attention-label">Waiting for you</span>
-      <p class="attention-text">{{ state?.waitingFor || 'The session needs input.' }}</p>
+      <p class="attention-text">{{ head?.waitingFor || 'The session needs input.' }}</p>
     </section>
 
     <p v-if="errorAttention" class="banner error">
@@ -83,17 +88,35 @@ function goBack(): void {
       withheld rather than shown out of order.
     </p>
 
+    <!-- Catching up after the phone was asleep: many chunks are missing at once,
+         so they are fetched a few at a time rather than in one burst. Ordinary,
+         and only shown while more than the newest chunk is outstanding. -->
+    <p v-else-if="detail?.inFlight" class="banner neutral">
+      Loading {{ detail.pendingChunks.length }} more chunks — a few at a time, so a catch-up does
+      not trip the API's rate limit.
+    </p>
+
+    <!-- Retention, not damage: deliberately styled apart from a gap. -->
+    <p v-if="detail?.pruned" class="banner info">
+      Earlier history not retained.
+      <template v-if="detail.pruned.droppedEvents > 0">
+        The relay keeps a rolling window, and {{ detail.pruned.droppedEvents }} earlier event(s) have
+        been dropped.
+      </template>
+      The stream is complete from here on.
+    </p>
+
     <p v-if="detail?.error" class="banner error">{{ detail.error }}</p>
 
     <!-- Activity strip -->
     <section class="card strip">
       <div class="cell">
         <span class="label">model</span>
-        <span class="value">{{ state?.model ?? detail?.summary.model ?? '—' }}</span>
+        <span class="value">{{ head?.model ?? detail?.summary.model ?? '—' }}</span>
       </div>
       <div class="cell">
         <span class="label">status</span>
-        <span class="value">{{ state?.status ?? 'unknown' }}</span>
+        <span class="value">{{ head?.status ?? 'unknown' }}</span>
       </div>
       <div class="cell">
         <span class="label">last event</span>
@@ -112,7 +135,7 @@ function goBack(): void {
       <div class="cell">
         <span class="label">chunks</span>
         <span class="value">
-          {{ detail?.chunksLoaded ?? 0 }}
+          {{ detail?.chunksLoaded ?? 0 }}<template v-if="(detail?.chunksTotal ?? 0) > 0">/{{ detail?.chunksTotal }}</template>
           <template v-if="(detail?.pendingChunks.length ?? 0) > 0">
             · {{ detail?.pendingChunks.length }} pending
           </template>
@@ -133,7 +156,7 @@ function goBack(): void {
 
     <SubagentTree v-if="detail && detail.subagents.length > 0" :nodes="detail.subagents" />
 
-    <CostPanel :cost="state?.cost" />
+    <CostPanel :cost="head?.cost" />
 
     <PromptComposer :session-id="props.sessionId" :controllable="controllable" />
   </div>
@@ -228,6 +251,21 @@ h1 {
   border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+/* Not a warning: something is still in flight, and it will resolve itself. */
+.banner.neutral {
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: var(--surface-2);
+}
+
+/* Retention, which is a plain fact rather than a fault — kept visually distinct
+   from the red of a sequence gap. */
+.banner.info {
+  border: 1px solid color-mix(in srgb, var(--info) 40%, var(--border));
+  color: var(--info);
+  background: color-mix(in srgb, var(--info) 10%, transparent);
 }
 
 .strip {
