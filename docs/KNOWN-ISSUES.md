@@ -31,15 +31,26 @@ request. Gitee differs from GitHub here, where 304s are free.
 **Consequence:** ETags save bandwidth but not request budget, so conditional
 polling buys nothing. Poll the branch ref and compare the commit SHA instead.
 
-### 3. Contents API maximum file size is unverified
+### 3. Contents API maximum file size — mostly moot, still unproven at the cap
 
-The bridge publishes chunks of at most 256 KB. Git transfer has no such limit,
-so **publishing is safe** — but the phone *reads* through the Contents API, where
-a per-file ceiling may apply (GitHub's is 1 MB). Base64 inflates by ~33%, so a
-256 KB chunk is ~341 KB on the wire.
+The bridge publishes chunks of at most 256 KB. Git transfer has no such limit, so
+**publishing is safe** regardless. The question was whether the phone could *read*
+a chunk back through the Contents API, where a per-file ceiling may apply
+(GitHub's is 1 MB); base64 inflates by ~33%.
 
-**Status:** unverified. Must be tested against a real chunk before the phone
-relies on it.
+**Verified against the real repository** — a chunk read back byte-exact:
+
+```
+blob sha 503f4006a953 (identical to the tree listing)
+size 16,849 → decoded 16,849   base64 round-trip exact
+21 events, correct kinds
+```
+
+In practice chunks are ~17 KB, not 256 KB, because sessions produce far fewer
+events than the cap allows. So the ceiling is unlikely ever to be reached.
+
+**Status:** read path proven at realistic sizes; the 256 KB cap itself remains
+untested. Revisit only if a session ever produces a chunk near it.
 
 ### 4. Inbound prompts are never consumed
 
