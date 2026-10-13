@@ -233,11 +233,34 @@ export class GiteeClient {
     }
   }
 
+  /**
+   * Pull a human-readable reason out of a failed response.
+   *
+   * Gitee reports validation failures as `{"messages":["sha is missing"]}`, not
+   * in GitHub's `{"message": "..."}` shape. Only handling the GitHub shape means
+   * every Gitee validation error degrades to "something unexpected", which is
+   * how a one-word answer — the missing `sha` that caused a failed write — gets
+   * thrown away.
+   *
+   * All three shapes are accepted, since the API is not consistent across
+   * endpoints.
+   */
   async #errorText(response: Response): Promise<string | null> {
     try {
-      const body = (await response.json()) as { message?: unknown; error?: unknown };
+      const body = (await response.json()) as {
+        message?: unknown;
+        error?: unknown;
+        messages?: unknown;
+      };
+
       if (typeof body.message === 'string' && body.message.length > 0) return body.message;
       if (typeof body.error === 'string' && body.error.length > 0) return body.error;
+
+      if (Array.isArray(body.messages)) {
+        const parts = body.messages.filter((m): m is string => typeof m === 'string' && m.length > 0);
+        if (parts.length > 0) return parts.join('; ');
+      }
+
       return null;
     } catch {
       return null;
@@ -308,11 +331,17 @@ export class GiteeClient {
       branch,
     };
 
-    type PutResponse = { content?: { sha?: string } };
-    const data = await this.#json<PutResponse>(
+    type WriteResponse = { content?: { sha?: string } };
+    const data = await this.#json<WriteResponse>(
       this.#url(`/contents/${encodePath(options.path)}`),
       {
-        method: 'PUT',
+        // POST, not PUT. Gitee's Contents API splits the two: POST creates a
+        // file, PUT updates one that already exists and refuses a new path with
+        // {"messages":["sha is missing"]} and HTTP 400. GitHub uses PUT for
+        // both, so assuming parity with GitHub breaks every first write — and
+        // since inbound prompt filenames are unique, *every* write here is a
+        // create.
+        method: 'POST',
         headers: this.#headers({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(body),
       },
