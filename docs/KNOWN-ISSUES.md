@@ -116,6 +116,25 @@ range. A range is O(1) however much history exists, which is exactly what a
 listing could not be. Retention (rolling ~10 MB per session, oldest chunk
 deleted) bounds the relay itself. See `docs/RELAY-DESIGN.md`.
 
+### 19. An orphaned bridge can survive its parent, and two writers corrupt quietly
+
+Observed for real: two bridges ran at once against one state directory, one
+holding stale code. They interleaved writes to the same chunk files, so some
+chunks carried valid checksums and most did not — a pattern that looks like
+corruption in the data rather than two processes fighting over it.
+
+The cause is that stopping an `npm run` wrapper does not reliably stop the node
+process it spawned, and the lock file records the pid of the process doing the
+work, so a surviving parent is invisible to it.
+
+**What helped:** the lock catches the common case, and killing by command-line
+pattern found both. **What would help more:** a heartbeat lock, where the holder
+rewrites a timestamp periodically and a newcomer refuses while it is fresh, which
+detects a live writer regardless of which pid started it.
+
+**Status:** open. Practical mitigation is to run one bridge and check for strays
+before starting another.
+
 ### 17. The reader's cache is smaller than the retention window
 
 The phone caches fetched chunks in `localStorage`, bounded at ~3 MB, while a
