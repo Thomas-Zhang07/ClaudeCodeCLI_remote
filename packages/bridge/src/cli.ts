@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * `ccr` — launch Claude Code in a session that can be driven from the phone.
  *
