@@ -473,7 +473,7 @@ export class Bridge {
 
   async #persist(): Promise<void> {
     const tails: Record<string, TailState> = {};
-    const sessions: Record<string, { seq: number }> = {};
+    const sessions: PersistedState['sessions'] = {};
 
     for (const runtime of this.#sessions.values()) {
       tails[runtime.tailer.path] = runtime.tailer.getState();
