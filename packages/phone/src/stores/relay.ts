@@ -667,8 +667,13 @@ export async function sendPrompt(text: string): Promise<SendOutcome> {
 
   const detail = relay.detail;
   if (!detail || detail.sessionId !== sessionId) return { ok: false, error: 'No session is open.' };
-  if (detail.head?.controllable === false) {
+  // Fail closed: only an explicit `true` counts. Testing for `=== false` would
+  // let a head that failed to parse, or predates the field, look writable.
+  if (detail.head?.controllable !== true) {
     return { ok: false, error: 'This session is read-only.' };
+  }
+  if (relay.index?.injectionEnabled !== true) {
+    return { ok: false, error: 'Prompts are turned off on the PC.' };
   }
   if (!isConfigured.value) return { ok: false, error: 'Configure the relay in Settings first.' };
   if (!canSign.value) return { ok: false, error: 'Set the shared secret in Settings first.' };

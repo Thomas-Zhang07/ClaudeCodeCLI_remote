@@ -8,7 +8,19 @@ import { canSign } from '@/lib/settings';
 import { MAX_PROMPT_BYTES, outboundFor, promptExpired, sendPrompt } from '@/stores/relay';
 import type { OutboundPrompt } from '@/types';
 
-const props = defineProps<{ sessionId: string; controllable: boolean }>();
+const props = defineProps<{
+  sessionId: string;
+  controllable: boolean;
+  /**
+   * Whether the PC will actually deliver a prompt.
+   *
+   * Deliberately separate from `controllable`: a session can be one the PC owns
+   * the terminal for, while the operator has still not allowed prompts. Offering
+   * a text box in that state collects a prompt that is written, never read, and
+   * never acknowledged — with nothing to explain why.
+   */
+  injectionEnabled: boolean;
+}>();
 
 const now = useNow(15_000);
 const text = ref('');
@@ -22,7 +34,8 @@ const byteLength = computed(() => new TextEncoder().encode(text.value.trim()).le
 const tooLong = computed(() => byteLength.value > MAX_PROMPT_BYTES);
 
 const blockedReason = computed<string | null>(() => {
-  if (!props.controllable) return null; // handled by the read-only notice
+  // Both of these are handled by a notice of their own.
+  if (!props.controllable || !props.injectionEnabled) return null;
   if (!canSign.value) return 'Add the shared secret in Settings before sending.';
   if (!cryptoReady) {
     return 'Web Crypto is unavailable here, so prompts cannot be signed. Open the app over https:// (or localhost).';
@@ -31,7 +44,12 @@ const blockedReason = computed<string | null>(() => {
 });
 
 const canSend = computed(
-  () => props.controllable && blockedReason.value === null && text.value.trim() !== '' && !tooLong.value,
+  () =>
+    props.controllable &&
+    props.injectionEnabled &&
+    blockedReason.value === null &&
+    text.value.trim() !== '' &&
+    !tooLong.value,
 );
 
 function statusLabel(prompt: OutboundPrompt): { label: string; tone: string } {
@@ -71,6 +89,11 @@ async function submit(): Promise<void> {
 
     <p v-if="!controllable" class="readonly">
       Read-only session — start it with <code>ccr</code> on the PC to send prompts.
+    </p>
+
+    <p v-else-if="!injectionEnabled" class="readonly">
+      Prompts are turned off on the PC, so this session can be watched but not driven.
+      Set <code>CCR_ALLOW_INJECTION=true</code> there to change that.
     </p>
 
     <template v-else>

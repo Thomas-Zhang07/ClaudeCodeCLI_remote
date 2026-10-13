@@ -33,6 +33,11 @@ const title = computed(() => {
 
 const waiting = computed(() => head.value?.status === 'waiting');
 const controllable = computed(() => head.value?.controllable === true);
+/**
+ * Strictly true only when the PC says so. An index written before the field
+ * existed, or one that failed to parse, must not be read as permission.
+ */
+const injectionEnabled = computed(() => relay.index?.injectionEnabled === true);
 
 const lastEventAt = computed(() => detail.value?.summary.lastEventTs ?? null);
 
@@ -158,7 +163,11 @@ function goBack(): void {
 
     <CostPanel :cost="head?.cost" />
 
-    <PromptComposer :session-id="props.sessionId" :controllable="controllable" />
+    <PromptComposer
+      :session-id="props.sessionId"
+      :controllable="controllable"
+      :injection-enabled="injectionEnabled"
+    />
   </div>
 </template>
 
