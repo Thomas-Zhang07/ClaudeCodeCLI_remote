@@ -67,20 +67,51 @@ export function sha256(buf: Buffer | string): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Monotonic counter for temporary filenames.
+ *
+ * A timestamp alone is not enough: two writes within the same millisecond would
+ * generate the same temporary name and corrupt each other.
+ */
+let tempCounter = 0;
+
+/** Windows error codes that mean "held open right now, try again". */
+const TRANSIENT_RENAME_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY']);
+
+/**
  * Write a file so a reader never observes a partial one.
  *
  * Writes alongside the target then renames, which is atomic within a volume.
- * The temporary name is randomised so concurrent writers cannot collide.
+ *
+ * The retry loop exists because of Windows: replacing a file that another
+ * process momentarily holds open fails with EPERM, and that happens routinely
+ * here — a virus scanner or the search indexer touching a file the instant it is
+ * written. Renaming is still the atomic option, so the answer is to retry
+ * briefly rather than to fall back to an in-place write that a reader could
+ * catch halfway.
  */
 export async function atomicWrite(path: string, data: string | Buffer): Promise<void> {
-  const tmp = `${path}.tmp-${process.pid}-${Date.now().toString(36)}`;
+  const tmp = `${path}.tmp-${process.pid}-${(tempCounter++).toString(36)}-${Date.now().toString(36)}`;
   await writeFile(tmp, data);
-  try {
-    await rename(tmp, path);
-  } catch (error) {
-    await rm(tmp, { force: true });
-    throw error;
+
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      await rename(tmp, path);
+      return;
+    } catch (error) {
+      lastError = error;
+      const code = (error as NodeJS.ErrnoException).code ?? '';
+      if (!TRANSIENT_RENAME_ERRORS.has(code)) break;
+      await delay(10 * 2 ** attempt);
+    }
   }
+
+  await rm(tmp, { force: true }).catch(() => {});
+  throw lastError;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function atomicWriteJson(path: string, value: unknown): Promise<void> {

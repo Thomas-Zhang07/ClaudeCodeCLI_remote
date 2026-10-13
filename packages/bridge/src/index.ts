@@ -25,6 +25,8 @@ import {
 
 import { ChunkWriter, atomicWriteJson } from './chunker.js';
 import { type BridgeConfig, loadConfig, loadEnvFile } from './config.js';
+import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
+import { RelaySync } from './sync.js';
 import {
   readJson,
   readRegistry,
@@ -39,6 +41,11 @@ interface PersistedState {
   version: 1;
   tails: Record<string, TailState>;
   sessions: Record<string, { seq: number }>;
+  /**
+   * Prompts already evaluated, so a rejected one is reported once rather than
+   * on every poll. They are deliberately not deleted — see `#pollInbound`.
+   */
+  seenPrompts: string[];
 }
 
 interface AgentRuntime {
@@ -65,10 +72,13 @@ export class Bridge {
   readonly #config: BridgeConfig;
   #sessions = new Map<string, SessionRuntime>();
   #registry = new Map<string, RegistryEntry>();
-  #persisted: PersistedState = { version: 1, tails: {}, sessions: {} };
+  #persisted: PersistedState = { version: 1, tails: {}, sessions: {}, seenPrompts: [] };
   #timers: NodeJS.Timeout[] = [];
   #running = false;
   #lastIndexWrite = 0;
+  #relay: RelaySync | null = null;
+  #relayDirty = false;
+  #seenPrompts = new Set<string>();
 
   constructor(config: BridgeConfig) {
     this.#config = config;
@@ -87,6 +97,8 @@ export class Bridge {
     await this.#rescan();
     await this.#tick();
 
+    await this.#startRelay();
+
     this.#timers.push(
       setInterval(() => {
         void this.#tick();
@@ -101,6 +113,130 @@ export class Bridge {
         void this.#persist();
       }, 5_000),
     );
+
+    if (this.#relay) {
+      this.#timers.push(
+        setInterval(() => {
+          void this.#publish();
+        }, this.#config.pushIntervalMs),
+        setInterval(() => {
+          void this.#pollInbound();
+        }, this.#config.pollIntervalMs),
+      );
+    }
+  }
+
+  /**
+   * Connect the relay, if one is configured.
+   *
+   * Monitoring works without it: with no repo URL the bridge simply writes
+   * locally, which is the read-only case.
+   */
+  async #startRelay(): Promise<void> {
+    const { repoUrl, repoToken, branch } = this.#config;
+    if (!repoUrl) return;
+
+    const relay = new RelaySync({
+      repoUrl,
+      token: repoToken,
+      branch,
+      cloneDir: join(this.#config.stateDir, 'repo'),
+      outDir: this.#config.outDir,
+      log: (message) => process.stderr.write(`[relay] ${message}\n`),
+    });
+
+    try {
+      await relay.init();
+      this.#relay = relay;
+    } catch (error) {
+      // A broken relay must not stop local monitoring.
+      process.stderr.write(`[relay] unavailable: ${String(error)}\n`);
+    }
+  }
+
+  async #publish(): Promise<void> {
+    const relay = this.#relay;
+    if (!relay || !this.#relayDirty) return;
+
+    try {
+      const outcome = await relay.publish(`relay: ${new Date().toISOString()}`);
+      if (outcome !== 'failed') this.#relayDirty = false;
+      if (outcome === 'failed') {
+        process.stderr.write('[relay] publish failed; will retry on the next tick\n');
+      }
+    } catch (error) {
+      process.stderr.write(`[relay] publish error: ${String(error)}\n`);
+    }
+  }
+
+  /**
+   * Read prompts the phone has written.
+   *
+   * Verified prompts are recorded but **not** consumed yet: injection arrives
+   * with the `ccr` wrapper, and consuming a prompt we cannot deliver would lose
+   * it silently. Prompts are marked seen so a rejected one is reported once
+   * rather than on every poll.
+   */
+  async #pollInbound(): Promise<void> {
+    const relay = this.#relay;
+    if (!relay) return;
+
+    let names: string[];
+    try {
+      names = await relay.listInbound();
+    } catch {
+      return;
+    }
+
+    for (const name of names) {
+      const raw = await relay.readInbound(name);
+      const promptId = extractPromptId(raw) ?? name;
+      if (this.#seenPrompts.has(promptId)) continue;
+      this.#seenPrompts.add(promptId);
+
+      const secret = this.#config.secret;
+      if (!secret) {
+        process.stderr.write(`[relay] ignoring ${name}: CCR_SECRET is not set\n`);
+        continue;
+      }
+
+      const result = verifyPrompt(raw, { secret, maxAgeMs: this.#config.promptMaxAgeMs });
+      if (!result.ok) {
+        process.stderr.write(`[relay] rejected ${name}: ${result.reason}\n`);
+        // Taken from a separate parse: the failure branch carries no prompt, but
+        // a rejected attempt still deserves to be visible against its session.
+        const target = parseInboundPrompt(raw)?.sessionId ?? null;
+        await this.#recordInjection(promptId, target, 'rejected', result.reason);
+        continue;
+      }
+
+      // Authenticated. Injection itself lands with the ccr wrapper.
+      await this.#recordInjection(promptId, result.prompt.sessionId, 'accepted', 'awaiting injection');
+    }
+  }
+
+  /** Surface a prompt's fate in the session timeline, so the phone sees it. */
+  async #recordInjection(
+    promptId: string,
+    sessionId: string | null,
+    state: 'accepted' | 'rejected',
+    detail: VerifyFailure | string,
+  ): Promise<void> {
+    if (!sessionId) return;
+    const runtime = this.#sessions.get(sessionId);
+    if (!runtime) return;
+
+    const event = runtime.aggregator.record({
+      ts: new Date().toISOString(),
+      sessionId,
+      agentId: null,
+      kind: 'injection',
+      promptId,
+      state,
+      detail,
+    });
+    await runtime.chunker.append(event);
+    this.#relayDirty = true;
   }
 
   async stop(): Promise<void> {
@@ -123,7 +259,11 @@ export class Bridge {
     try {
       const raw = await readFile(join(this.#config.stateDir, 'bridge-state.json'), 'utf8');
       const parsed = JSON.parse(raw) as PersistedState;
-      if (parsed && parsed.version === 1) this.#persisted = parsed;
+      if (parsed && parsed.version === 1) {
+        // Tolerate a state file written before this field existed.
+        this.#persisted = { ...parsed, seenPrompts: parsed.seenPrompts ?? [] };
+        this.#seenPrompts = new Set(this.#persisted.seenPrompts);
+      }
     } catch {
       // No prior state: every session starts from a cold-start window.
     }
@@ -139,7 +279,7 @@ export class Bridge {
       sessions[runtime.sessionId] = { seq: runtime.aggregator.seq };
     }
 
-    this.#persisted = { version: 1, tails, sessions };
+    this.#persisted = { version: 1, tails, sessions, seenPrompts: [...this.#seenPrompts] };
 
     const path = join(this.#config.stateDir, 'bridge-state.json');
     const tmp = `${path}.tmp`;
@@ -252,7 +392,10 @@ export class Bridge {
     const main = await runtime.tailer.poll();
     for (const line of main) {
       const result = runtime.aggregator.ingest(line, null);
-      for (const event of result.events) await runtime.chunker.append(event);
+      for (const event of result.events) {
+        await runtime.chunker.append(event);
+        this.#relayDirty = true;
+      }
       if (result.stateDirty) runtime.stateDirty = true;
     }
 
@@ -263,7 +406,10 @@ export class Bridge {
         // sessionId, so without the agent id these events would be
         // indistinguishable from the main thread's.
         const result = runtime.aggregator.ingest(line, agent.agentId);
-        for (const event of result.events) await runtime.chunker.append(event);
+        for (const event of result.events) {
+          await runtime.chunker.append(event);
+          this.#relayDirty = true;
+        }
         if (result.stateDirty) runtime.stateDirty = true;
       }
     }
@@ -311,6 +457,19 @@ export class Bridge {
     };
     await atomicWriteJson(join(this.#config.outDir, 'index.json'), index);
   }
+}
+
+/**
+ * Best-effort prompt id from a raw payload.
+ *
+ * Used only for de-duplication, so an unreadable payload falls back to the
+ * filename rather than being discarded — a malformed prompt still deserves to be
+ * reported once instead of silently ignored.
+ */
+function extractPromptId(raw: unknown): string | null {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const id = (raw as Record<string, unknown>)['promptId'];
+  return typeof id === 'string' && id.length > 0 ? id : null;
 }
 
 export async function main(): Promise<void> {

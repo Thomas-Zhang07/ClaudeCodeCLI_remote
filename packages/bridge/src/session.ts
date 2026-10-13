@@ -17,6 +17,7 @@ import {
   buildSubagentTree,
   parseTranscriptEntry,
   parseSubagentMeta,
+  type InjectionEvent,
   type NormalizedEvent,
   type RegistryEntry,
   type SessionState,
@@ -241,6 +242,18 @@ export class SessionAggregator {
       statuses: this.#statuses,
       models: this.#models,
     });
+  }
+
+  /**
+   * Append an event originated by the bridge rather than read from a transcript.
+   *
+   * Keeps sequencing in one place: injection outcomes interleave with transcript
+   * events and must share the same monotonic counter, or the phone sees gaps.
+   */
+  record(draft: Omit<InjectionEvent, 'seq'>): NormalizedEvent {
+    const event = { ...draft, seq: this.#seq++ } as NormalizedEvent;
+    this.#lastEventAt = Date.now();
+    return event;
   }
 
   #titleEvent(title: string, ts: string): NormalizedEvent {

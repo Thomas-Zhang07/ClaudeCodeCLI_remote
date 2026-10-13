@@ -138,6 +138,24 @@ describe('ChunkWriter', () => {
     expect(JSON.parse(lines.at(-1)!).t).toBe('chunk_end');
   });
 
+  it('survives many rapid seals, which stresses rename-over-existing', async () => {
+    // On Windows, replacing a file another process holds open fails with EPERM.
+    // Sealing repeatedly rewrites the manifest constantly, which is exactly the
+    // pattern that surfaced it.
+    const w = new ChunkWriter({ dir, maxChunkBytes: 100 });
+    await w.open('sess-1');
+    for (let i = 1; i <= 60; i++) await w.append(event(i, 40));
+    await w.finish(state());
+
+    const manifest = await readManifest();
+    expect(manifest.chunks.length).toBeGreaterThan(5);
+
+    // Every sealed chunk is complete and the stream has no gaps.
+    for (let i = 1; i < manifest.chunks.length; i++) {
+      expect(manifest.chunks[i]!.firstSeq).toBe(manifest.chunks[i - 1]!.lastSeq + 1);
+    }
+  });
+
   describe('recovery from a crash mid-chunk', () => {
     it('resumes the unterminated chunk rather than discarding it', async () => {
       const first = new ChunkWriter({ dir });

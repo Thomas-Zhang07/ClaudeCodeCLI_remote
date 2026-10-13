@@ -28,6 +28,8 @@ export interface BridgeConfig {
   pollIntervalMs: number;
 
   allowInjection: boolean;
+  /** Prompts older than this are refused, bounding the value of a captured file. */
+  promptMaxAgeMs: number;
 
   /** Bytes of tail window to replay when a session is seen for the first time. */
   coldStartBytes: number;
@@ -83,6 +85,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     pollIntervalMs: num(env['CCR_POLL_MS'], 10_000),
 
     allowInjection: bool(env['CCR_ALLOW_INJECTION']),
+    promptMaxAgeMs: num(env['CCR_PROMPT_MAX_AGE_MS'], 10 * 60 * 1000),
 
     coldStartBytes: num(env['CCR_COLD_START_BYTES'], 256 * 1024),
     pollFilesMs: num(env['CCR_POLL_FILES_MS'], 400),
