@@ -95,6 +95,9 @@ export class Bridge {
   /** Pids of sessions launched through `ccr`, refreshed with the registry. */
   #controlledPids = new Set<number>();
   #publishTimer: NodeJS.Timeout | null = null;
+  #publishing = false;
+  /** A trigger arrived while a publish was already running. */
+  #republish = false;
 
   constructor(config: BridgeConfig) {
     this.#config = config;
@@ -196,14 +199,30 @@ export class Bridge {
     const relay = this.#relay;
     if (!relay || !this.#relayDirty) return;
 
+    // Only one publish at a time. The debounce timer can fire while a previous
+    // publish is still mid-copy, and two of them racing on the same clone —
+    // one clearing the output subtree while the other copies into it — fails
+    // with EEXIST and loses whichever attempt noticed.
+    if (this.#publishing) {
+      this.#republish = true;
+      return;
+    }
+
+    this.#publishing = true;
     try {
       const outcome = await relay.publish(`relay: ${new Date().toISOString()}`);
       if (outcome !== 'failed') this.#relayDirty = false;
-      if (outcome === 'failed') {
-        process.stderr.write('[relay] publish failed; will retry on the next tick\n');
-      }
+      else process.stderr.write('[relay] publish failed; will retry on the next tick\n');
     } catch (error) {
       process.stderr.write(`[relay] publish error: ${String(error)}\n`);
+    } finally {
+      this.#publishing = false;
+      // A trigger that arrived mid-publish must not be dropped: there may be no
+      // further turn boundary for a long time, and the data would sit unsent.
+      if (this.#republish) {
+        this.#republish = false;
+        this.#schedulePublish();
+      }
     }
   }
 
