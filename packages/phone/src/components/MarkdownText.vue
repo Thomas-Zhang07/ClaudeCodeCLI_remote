@@ -1,32 +1,94 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { parseBlocks } from '@/lib/markdown';
+import { parseBlocks, type Block, type Inline } from '@/lib/markdown';
 
-const props = defineProps<{ text: string }>();
+/**
+ * Renders a transcript excerpt.
+ *
+ * The component renders its own children, so it takes three shapes of input:
+ * `text` is a whole message and is parsed here, `blocks` is an already-parsed
+ * nested list (a quote's body, a list item's body) and `inline` is a set of
+ * spans inside one paragraph. Exactly one is supplied.
+ *
+ * Everything becomes Vue text nodes and elements — never `v-html` — so a
+ * transcript containing `<script>` or `<img onerror=…>` renders as those
+ * characters and nothing else. The only transcript value that reaches an
+ * attribute is a link's `href`, which the parser has already screened.
+ */
+const props = defineProps<{
+  text?: string;
+  blocks?: Block[];
+  inline?: Inline[];
+}>();
 
-const blocks = computed(() => parseBlocks(props.text));
+const blocks = computed<Block[]>(() => props.blocks ?? parseBlocks(props.text ?? ''));
+const nodes = computed<Inline[] | null>(() => props.inline ?? null);
 </script>
 
 <template>
-  <div class="md">
+  <div v-if="nodes === null" class="md">
     <template v-for="block in blocks" :key="block.id">
       <pre v-if="block.type === 'code'" class="code"><code>{{ block.value }}</code></pre>
+
+      <component :is="`h${block.level}`" v-else-if="block.type === 'heading'" class="heading">
+        <MarkdownText :inline="block.inline" />
+      </component>
+
+      <hr v-else-if="block.type === 'rule'" class="rule" />
+
+      <blockquote v-else-if="block.type === 'quote'" class="quote">
+        <MarkdownText :blocks="block.blocks" />
+      </blockquote>
+
+      <ul v-else-if="block.type === 'list' && !block.ordered" class="list">
+        <li v-for="item in block.items" :key="item.id" class="item">
+          <MarkdownText :blocks="item.blocks" />
+        </li>
+      </ul>
+
+      <ol v-else-if="block.type === 'list'" class="list" :start="block.start">
+        <li v-for="item in block.items" :key="item.id" class="item">
+          <MarkdownText :blocks="item.blocks" />
+        </li>
+      </ol>
+
       <p v-else class="para">
         <!-- Rendered as text nodes: transcripts are untrusted input and are
              never inserted as markup. -->
-        <template v-for="(part, index) in block.inline" :key="index">
-          <code v-if="part.type === 'code'" class="inline-code">{{ part.value }}</code>
-          <template v-else>{{ part.value }}</template>
-        </template>
+        <MarkdownText :inline="block.inline" />
       </p>
     </template>
   </div>
+
+  <!-- Inline spans, rendered without a wrapper so they can sit inside the
+       element their parent chose (`<strong>`, `<a>`, `<p>`). -->
+  <template v-else>
+    <template v-for="(node, index) in nodes" :key="index">
+      <code v-if="node.type === 'code'" class="inline-code">{{ node.value }}</code>
+      <strong v-else-if="node.type === 'strong'"><MarkdownText :inline="node.children" /></strong>
+      <em v-else-if="node.type === 'em'"><MarkdownText :inline="node.children" /></em>
+      <a
+        v-else-if="node.type === 'link'"
+        class="link"
+        :href="node.href"
+        target="_blank"
+        rel="noopener noreferrer"
+      ><MarkdownText :inline="node.children" /></a>
+      <template v-else>{{ node.value }}</template>
+    </template>
+  </template>
 </template>
 
 <style scoped>
 .md {
   min-width: 0;
+}
+
+/* Space every block apart, whatever kind it is. `:not(:first-child)` rather
+   than `* + *` so this outranks the per-block `margin: 0` below. */
+.md > :not(:first-child) {
+  margin-top: 8px;
 }
 
 .para {
@@ -36,26 +98,74 @@ const blocks = computed(() => parseBlocks(props.text));
   overflow-wrap: anywhere;
 }
 
-.para + .para,
-.para + .code,
-.code + .para,
-.code + .code {
-  margin-top: 8px;
+.heading {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+h1.heading {
+  font-size: 1.3em;
+}
+
+h2.heading {
+  font-size: 1.18em;
+}
+
+h3.heading {
+  font-size: 1.08em;
+}
+
+h4.heading,
+h5.heading,
+h6.heading {
+  font-size: 1em;
+  color: var(--muted);
+}
+
+.rule {
+  margin: 0;
+  border: none;
+  border-top: 1px solid var(--border);
+}
+
+.quote {
+  margin: 0;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+
+.list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.item + .item {
+  margin-top: 4px;
 }
 
 .code {
+  margin: 0;
   background: var(--surface-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   line-height: 1.45;
   white-space: pre;
+  overflow-x: auto;
 }
 
 .inline-code {
   background: var(--surface-3);
   border-radius: 4px;
   padding: 1px 4px;
+  overflow-wrap: anywhere;
+}
+
+.link {
+  color: var(--accent);
   overflow-wrap: anywhere;
 }
 </style>

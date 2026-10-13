@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import { PASTE_END, PASTE_START, injectPrompt, splitByBytes, type WriteTarget } from '../src/inject.js';
+import {
+  PASTE_END,
+  PASTE_START,
+  injectPrompt,
+  injectionRefusal,
+  splitByBytes,
+  type WriteTarget,
+} from '../src/inject.js';
 
 /** Records everything written, so the framing can be asserted exactly. */
 function recorder(): WriteTarget & { chunks: string[]; all: () => string } {
@@ -13,6 +20,67 @@ function recorder(): WriteTarget & { chunks: string[]; all: () => string } {
     all: () => chunks.join(''),
   };
 }
+
+describe('injectionRefusal', () => {
+  const ready = {
+    injectionEnabled: true,
+    hasSession: true,
+    controllable: true,
+    lastMainKind: 'turn_end',
+  };
+
+  it('allows a prompt when the session is idle after a completed turn', () => {
+    expect(injectionRefusal(ready)).toBeNull();
+  });
+
+  it('refuses while the operator has injection switched off', () => {
+    expect(injectionRefusal({ ...ready, injectionEnabled: false })).toBe('injection-disabled');
+  });
+
+  it('refuses a session the bridge does not know', () => {
+    expect(injectionRefusal({ ...ready, hasSession: false })).toBe('unknown-session');
+  });
+
+  it('refuses a session no ccr process owns', () => {
+    expect(injectionRefusal({ ...ready, controllable: false })).toBe('not-controllable');
+  });
+
+  describe('the mid-turn guard', () => {
+    // A permission dialog only exists mid-turn, so anything other than a
+    // completed turn might be a dialog — and typing into a dialog answers it,
+    // which can approve a tool rather than submit a prompt.
+    it.each([
+      'assistant_text',
+      'tool_call',
+      'turn_start',
+      'user_prompt',
+      'attention',
+    ])('refuses while the last main-thread event is %s', (kind) => {
+      expect(injectionRefusal({ ...ready, lastMainKind: kind })).toBe('session-not-idle');
+    });
+
+    it('refuses a session that has produced no main-thread events at all', () => {
+      expect(injectionRefusal({ ...ready, lastMainKind: null })).toBe('session-not-idle');
+    });
+
+    it('fails closed on a status it does not recognise', () => {
+      expect(injectionRefusal({ ...ready, lastMainKind: 'something-new' })).toBe('session-not-idle');
+    });
+  });
+
+  it('checks the policy before anything else, so a disabled bridge never types', () => {
+    // Even a session that would otherwise be rejected outright is reported as
+    // disabled, because that is the reason the operator can act on.
+    expect(
+      injectionRefusal({
+        injectionEnabled: false,
+        hasSession: false,
+        controllable: false,
+        lastMainKind: null,
+      }),
+    ).toBe('injection-disabled');
+  });
+});
 
 describe('splitByBytes', () => {
   it('returns the whole string when it fits', () => {

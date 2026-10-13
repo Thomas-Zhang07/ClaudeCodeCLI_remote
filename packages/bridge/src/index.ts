@@ -28,8 +28,13 @@ import {
 import { ChunkWriter, atomicWriteJson } from './chunker.js';
 import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { readControlled } from './control.js';
-import { isProcessAlive } from './control.js';
+import {
+  isProcessAlive,
+  sendControlMessage,
+  type ControlledSession,
+} from './control.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
+import { injectionRefusal } from './inject.js';
 import { RelaySync } from './sync.js';
 import {
   readJson,
@@ -80,6 +85,14 @@ interface SessionRuntime {
   stateDirty: boolean;
   /** Agents appear throughout a session's life, so discovery is re-run. */
   lastAgentScan: number;
+  /**
+   * Kind of the most recent event from the *main thread*.
+   *
+   * Used to decide whether a prompt can safely be typed in. Subagent events are
+   * excluded deliberately: they arrive on independent schedules and would
+   * otherwise make the main thread look busy, or idle, at random.
+   */
+  lastMainKind: string | null;
 }
 
 export class Bridge {
@@ -93,8 +106,8 @@ export class Bridge {
   #relay: RelaySync | null = null;
   #relayDirty = false;
   #seenPrompts = new Set<string>();
-  /** Pids of sessions launched through `ccr`, refreshed with the registry. */
-  #controlledPids = new Set<number>();
+  /** Sessions launched through `ccr`, by pid, refreshed with the registry. */
+  #controlledPids = new Map<number, ControlledSession>();
   #publishTimer: NodeJS.Timeout | null = null;
   #publishing = false;
   /** A trigger arrived while a publish was already running. */
@@ -280,12 +293,64 @@ export class Bridge {
         // a rejected attempt still deserves to be visible against its session.
         const target = parseInboundPrompt(raw)?.sessionId ?? null;
         await this.#recordInjection(promptId, target, 'rejected', result.reason);
+        await relay.markConsumed([name]).catch(() => {});
         continue;
       }
 
-      // Authenticated. Injection itself lands with the ccr wrapper.
-      await this.#recordInjection(promptId, result.prompt.sessionId, 'accepted', 'awaiting injection');
+      await this.#deliverPrompt(result.prompt, name);
     }
+  }
+
+  /**
+   * Hand a verified prompt to the session that owns it.
+   *
+   * The outcome is always recorded against the session, including refusals,
+   * because a prompt that silently goes nowhere is the worst possible result:
+   * the phone shows "awaiting acknowledgement" and nothing anywhere says why.
+   */
+  async #deliverPrompt(
+    prompt: { sessionId: string; promptId: string; text: string },
+    inboundName: string,
+  ): Promise<void> {
+    const relay = this.#relay;
+    const runtime = this.#sessions.get(prompt.sessionId);
+    const entry = this.#registry.get(prompt.sessionId) ?? null;
+
+    const refuse = async (state: 'rejected', reason: string): Promise<void> => {
+      process.stderr.write(`[relay] refusing ${prompt.promptId}: ${reason}\n`);
+      await this.#recordInjection(prompt.promptId, prompt.sessionId, state, reason);
+      // Consumed either way: a refusal is an answer, and leaving it in place
+      // would re-evaluate the same prompt on every poll forever.
+      await relay?.markConsumed([inboundName]).catch(() => {});
+    };
+
+    const registration = entry ? this.#controlledPids.get(entry.pid) : undefined;
+    const refusal = injectionRefusal({
+      injectionEnabled: this.#config.allowInjection,
+      hasSession: Boolean(runtime && entry),
+      controllable: Boolean(registration),
+      lastMainKind: runtime?.lastMainKind ?? null,
+    });
+    if (refusal) return refuse('rejected', refusal);
+
+    // The guard has already refused when either is missing; repeating it here is
+    // what narrows the types for the rest of the function.
+    if (!registration || !entry) return refuse('rejected', 'not-controllable');
+
+    const reply = await sendControlMessage(registration.pipe, {
+      type: 'prompt',
+      promptId: prompt.promptId,
+      text: prompt.text,
+    });
+
+    if (!reply) return refuse('rejected', 'session-unreachable');
+    if (reply.type !== 'accepted') return refuse('rejected', reply.reason ?? 'refused');
+
+    process.stderr.write(`[relay] delivered ${prompt.promptId} to pid ${entry.pid}\n`);
+    // 'accepted' means it reached the terminal, not that Claude acted on it.
+    // Only the transcript can confirm that, so the wording stays honest.
+    await this.#recordInjection(prompt.promptId, prompt.sessionId, 'accepted', 'typed into the session');
+    await this.#relay?.markConsumed([inboundName]).catch(() => {});
   }
 
   /** Surface a prompt's fate in the session timeline, so the phone sees it. */
@@ -478,6 +543,7 @@ export class Bridge {
       agents: new Map(),
       stateDirty: true,
       lastAgentScan: 0,
+      lastMainKind: null,
     });
   }
 
@@ -488,7 +554,7 @@ export class Bridge {
     // Sessions launched through `ccr` register themselves; matching on pid is
     // what separates a session we can type into from one we can only watch.
     const controlled = await readControlled(this.#config.stateDir);
-    this.#controlledPids = new Set(controlled.map((c) => c.pid));
+    this.#controlledPids = new Map(controlled.map((c) => [c.pid, c]));
 
     for (const runtime of this.#sessions.values()) {
       const entry = this.#registry.get(runtime.sessionId) ?? null;
@@ -560,7 +626,7 @@ export class Bridge {
         // sessionId, so without the agent id these events would be
         // indistinguishable from the main thread's.
         const result = runtime.aggregator.ingest(line, agent.agentId);
-        await this.#append(runtime, result.events);
+        await this.#append(runtime, result.events, true);
         if (result.stateDirty) runtime.stateDirty = true;
       }
     }
@@ -578,9 +644,14 @@ export class Bridge {
    * locally until one of those arrives, which is what keeps pushes rare enough
    * for the repository to stay small.
    */
-  async #append(runtime: SessionRuntime, events: readonly NormalizedEvent[]): Promise<void> {
+  async #append(
+    runtime: SessionRuntime,
+    events: readonly NormalizedEvent[],
+    fromAgent = false,
+  ): Promise<void> {
     for (const event of events) {
       await runtime.chunker.append(event);
+      if (!fromAgent) runtime.lastMainKind = event.kind;
       this.#relayDirty = true;
       // Appending moves the chunk range, and `head.json` is what tells the
       // reader about it. Leaving this to the aggregator's own dirty flag would

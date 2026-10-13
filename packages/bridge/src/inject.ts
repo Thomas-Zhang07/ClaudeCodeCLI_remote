@@ -25,6 +25,50 @@ export interface WriteTarget {
   write(data: string): void;
 }
 
+/** Why a prompt was not typed into a session. */
+export type InjectionRefusal =
+  | 'injection-disabled'
+  | 'unknown-session'
+  | 'not-controllable'
+  | 'session-not-idle';
+
+export interface InjectionContext {
+  /** The operator has allowed prompts at all. */
+  injectionEnabled: boolean;
+  /** The session is known to the bridge. */
+  hasSession: boolean;
+  /** A live `ccr` registration owns this session's terminal. */
+  controllable: boolean;
+  /** Kind of the most recent main-thread event, or null if there is none. */
+  lastMainKind: string | null;
+}
+
+/**
+ * Decide whether a prompt may be typed into a session.
+ *
+ * Pure and separate from delivery so the rule can be tested directly, because
+ * it is the rule that keeps typing from being dangerous.
+ *
+ * The `turn_end` requirement is the important one. **A permission dialog only
+ * exists mid-turn**, so requiring the main thread to have *finished* a turn
+ * proves no dialog is open — and typing into a dialog answers it, which can
+ * approve a tool rather than submit a prompt.
+ *
+ * It is checked against the transcript rather than the session's status because
+ * "waiting for input" is what an idle prompt reports too, so the status cannot
+ * tell the two apart. Injecting mid-turn is merely unhelpful, since Claude Code
+ * queues it; answering a dialog is not.
+ *
+ * Fails closed: anything unrecognised refuses.
+ */
+export function injectionRefusal(context: InjectionContext): InjectionRefusal | null {
+  if (!context.injectionEnabled) return 'injection-disabled';
+  if (!context.hasSession) return 'unknown-session';
+  if (!context.controllable) return 'not-controllable';
+  if (context.lastMainKind !== 'turn_end') return 'session-not-idle';
+  return null;
+}
+
 export interface InjectOptions {
   /** Bytes per write. Large writes can be mistaken for a paste mid-render. */
   chunkBytes?: number;
