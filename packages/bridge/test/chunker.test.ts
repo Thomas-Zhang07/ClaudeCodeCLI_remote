@@ -143,6 +143,60 @@ describe('ChunkWriter', () => {
     expect(JSON.parse(lines.at(-1)!).t).toBe('chunk_end');
   });
 
+  describe('a chunk that begins at sequence zero', () => {
+    it('signs the sentinel with sequence 0, not the second event sequence', async () => {
+      // Regression. `firstSeq` used 0 as its "nothing seen yet" marker, but 0 is
+      // a real sequence — a session's first event is seq 0. The sentinel was
+      // therefore signed over the *second* event's sequence, while the reader
+      // derives it from the chunk's actual first event, so the checksum never
+      // matched and the reader rejected the whole chunk and showed nothing.
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append(event(0));
+      await w.append(event(1));
+      await w.finish();
+
+      const lines = (await readFile(join(dir, chunkFilename(1)), 'utf8')).trim().split('\n');
+      const sentinel = JSON.parse(lines.at(-1)!);
+
+      expect(sentinel.lines).toBe(2);
+      expect(sentinel.crc32).toBe(crc32(Buffer.from(`0:${sentinel.lines}`)));
+      expect(sentinel.crc32).not.toBe(crc32(Buffer.from(`1:${sentinel.lines}`)));
+    });
+
+    it('reports firstSeq 0 in the range', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append(event(0));
+      await w.append(event(1));
+      await w.finish();
+
+      expect(w.range.firstSeq).toBe(0);
+      expect(w.range.lastSeq).toBe(1);
+
+      const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'));
+      expect(manifest.chunks[0].firstSeq).toBe(0);
+      expect(manifest.chunks[0].lastSeq).toBe(1);
+    });
+
+    it('recovers sequence 0 from a partial chunk after a crash', async () => {
+      const first = new ChunkWriter({ dir });
+      await first.open('sess-1');
+      await first.append(event(0));
+      // No seal: this is what a crash leaves behind.
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+
+      await second.append(event(1));
+      await second.finish();
+
+      const lines = (await readFile(join(dir, chunkFilename(1)), 'utf8')).trim().split('\n');
+      const sentinel = JSON.parse(lines.at(-1)!);
+      expect(sentinel.crc32).toBe(crc32(Buffer.from(`0:${sentinel.lines}`)));
+    });
+  });
+
   describe('retention', () => {
     it('deletes the oldest chunk and advances chunkFirst', async () => {
       const w = new ChunkWriter({ dir, maxChunkBytes: 120, retainBytes: 400 });

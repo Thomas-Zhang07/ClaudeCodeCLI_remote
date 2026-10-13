@@ -29,6 +29,7 @@ import type {
 
 export const DEFAULT_CHUNK_BYTES = 256 * 1024;
 export const DEFAULT_RETAIN_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_MAX_CHUNKS = 300;
 
 export function chunkFilename(n: number): string {
   return `events-${String(n).padStart(4, '0')}.jsonl`;
@@ -136,6 +137,14 @@ export interface ChunkWriterOptions {
   /** Retained bytes for this session before the oldest chunk is deleted. */
   retainBytes?: number;
   /**
+   * Retained chunk count for this session.
+   *
+   * A second bound because a chunk is sealed at every publish, so a session of
+   * small turns produces many small chunks and would hit a large file count long
+   * before it hit a byte budget.
+   */
+  maxChunks?: number;
+  /**
    * Where to keep the writer's own bookkeeping.
    *
    * Deliberately **outside** `dir`, and therefore outside the published tree.
@@ -156,12 +165,23 @@ export class ChunkWriter {
   readonly #dir: string;
   readonly #maxChunkBytes: number;
   readonly #retainBytes: number;
+  readonly #maxChunks: number;
   readonly #manifestPath: string;
 
   #chunk = 1;
   #bytes = 0;
   #lines = 0;
-  #firstSeq = 0;
+  /**
+   * Sequence of the first event in the open chunk, or null when it is empty.
+   *
+   * Null rather than 0, because 0 is a legitimate sequence: a session's first
+   * event is seq 0. Using 0 as the "unset" marker made the first event's
+   * sequence invisible, so the sentinel was signed over the *second* event's
+   * sequence instead. The reader derives the checksum from the chunk's actual
+   * first event, so every affected chunk failed validation and was rejected
+   * whole — the reader showed nothing at all.
+   */
+  #firstSeq: number | null = null;
   #sealed: ChunkEntry[] = [];
   #sealedBytes = 0;
   #droppedEvents = 0;
@@ -172,6 +192,7 @@ export class ChunkWriter {
     this.#dir = options.dir;
     this.#maxChunkBytes = options.maxChunkBytes ?? DEFAULT_CHUNK_BYTES;
     this.#retainBytes = options.retainBytes ?? DEFAULT_RETAIN_BYTES;
+    this.#maxChunks = options.maxChunks ?? DEFAULT_MAX_CHUNKS;
     this.#manifestPath = options.manifestPath ?? join(options.dir, 'manifest.json');
   }
 
@@ -180,7 +201,10 @@ export class ChunkWriter {
   }
 
   get lastSeq(): number {
-    return this.#sealed.at(-1)?.lastSeq ?? this.#firstSeq - 1 + this.#lines;
+    if (this.#lines === 0 || this.#firstSeq === null) {
+      return this.#sealed.at(-1)?.lastSeq ?? -1;
+    }
+    return this.#firstSeq + this.#lines - 1;
   }
 
   /**
@@ -202,9 +226,9 @@ export class ChunkWriter {
     return {
       chunkFirst: oldest?.n ?? this.#chunk,
       chunkLast: hasOpenEvents ? this.#chunk : (newestSealed?.n ?? this.#chunk - 1),
-      firstSeq: oldest?.firstSeq ?? this.#firstSeq,
+      firstSeq: oldest?.firstSeq ?? this.#firstSeq ?? 0,
       lastSeq: hasOpenEvents
-        ? this.#firstSeq + this.#lines - 1
+        ? (this.#firstSeq ?? 0) + this.#lines - 1
         : (newestSealed?.lastSeq ?? 0),
       retainedBytes: this.#sealedBytes + this.#bytes,
       droppedEvents: this.#droppedEvents,
@@ -253,7 +277,9 @@ export class ChunkWriter {
           const parsed = JSON.parse(trimmed) as { seq?: number; t?: string };
           if (parsed.t === 'chunk_end') continue;
           if (typeof parsed.seq === 'number') {
-            if (this.#firstSeq === 0) this.#firstSeq = parsed.seq;
+            // The first event recovered from a partial chunk, so sequence 0
+            // counts — only null means "nothing seen yet".
+            if (this.#firstSeq === null) this.#firstSeq = parsed.seq;
           }
           this.#lines++;
           this.#bytes += Buffer.byteLength(`${trimmed}\n`, 'utf8');
@@ -276,7 +302,7 @@ export class ChunkWriter {
     const line = `${JSON.stringify(event)}\n`;
     const size = Buffer.byteLength(line, 'utf8');
 
-    if (this.#firstSeq === 0) this.#firstSeq = event.seq;
+    if (this.#firstSeq === null) this.#firstSeq = event.seq;
 
     await writeFile(join(this.#dir, chunkFilename(this.#chunk)), line, { flag: 'a' });
     this.#bytes += size;
@@ -293,7 +319,7 @@ export class ChunkWriter {
    * The sentinel is written last so its presence proves the chunk is complete.
    */
   async seal(): Promise<ChunkEntry | null> {
-    if (this.#lines === 0) return null;
+    if (this.#lines === 0 || this.#firstSeq === null) return null;
 
     const path = join(this.#dir, chunkFilename(this.#chunk));
     const sentinel: ChunkEndSentinel = {
@@ -320,7 +346,9 @@ export class ChunkWriter {
     this.#chunk += 1;
     this.#bytes = 0;
     this.#lines = 0;
-    this.#firstSeq = 0;
+    // Back to "empty", not to 0 — the next chunk's first event may itself be
+    // sequence 0 if it is the session's first.
+    this.#firstSeq = null;
 
     await this.#enforceRetention();
     await this.#persistManifest();
@@ -336,7 +364,11 @@ export class ChunkWriter {
    * an empty session.
    */
   async #enforceRetention(): Promise<void> {
-    while (this.#sealedBytes + this.#bytes > this.#retainBytes && this.#sealed.length > 1) {
+    const overBudget = (): boolean =>
+      this.#sealedBytes + this.#bytes > this.#retainBytes ||
+      this.#sealed.length > this.#maxChunks;
+
+    while (overBudget() && this.#sealed.length > 1) {
       const oldest = this.#sealed.shift();
       if (!oldest) break;
 

@@ -213,6 +213,19 @@ export class Bridge {
 
     this.#publishing = true;
     try {
+      // Seal every open chunk before publishing, so anything the reader can
+      // fetch is complete.
+      //
+      // Chunk numbers advance only on a seal, so an open chunk is one the reader
+      // can see named in `head.json` but cannot validate: it has no sentinel,
+      // and the reader correctly refuses to cache or trust it. A session whose
+      // turns are small enough never to fill a chunk would therefore never
+      // publish anything readable at all — which is most sessions.
+      for (const runtime of this.#sessions.values()) {
+        await runtime.chunker.seal().catch(() => {});
+        await this.#writeHead(runtime).catch(() => {});
+      }
+
       const outcome = await relay.publish(`relay: ${new Date().toISOString()}`);
       if (outcome !== 'failed') this.#relayDirty = false;
       else process.stderr.write('[relay] publish failed; will retry on the next tick\n');
@@ -446,6 +459,7 @@ export class Bridge {
     const chunker = new ChunkWriter({
       dir: sessionDir,
       retainBytes: this.#config.retainBytes,
+      maxChunks: this.#config.maxChunksPerSession,
       // Bookkeeping lives outside the published tree: it is rewritten on every
       // seal, and publishing it would add a changed blob to every publish for
       // the reader to ignore.
