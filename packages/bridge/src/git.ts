@@ -151,7 +151,25 @@ export async function ensureClone(options: {
   const top = await git(['rev-parse', '--show-toplevel'], { cwd: dir });
   if (top.code === 0 && samePath(top.stdout.trim(), dir)) {
     const remote = await git(['remote', 'get-url', 'origin'], { cwd: dir });
-    if (remote.code === 0 && remote.stdout.trim().length > 0) return;
+    const existing = remote.stdout.trim();
+
+    if (remote.code === 0 && existing.length > 0) {
+      // An existing clone whose remote points somewhere else must be corrected,
+      // not trusted. Fetching from a stale remote while pushing to the
+      // configured one appears to work and produces very confusing failures
+      // later — a fast-forward against the wrong history, or a push that
+      // silently omits everything the other remote had.
+      if (existing !== options.repoUrl) {
+        await gitOrThrow(['remote', 'set-url', 'origin', options.repoUrl], { cwd: dir });
+      }
+
+      // Upgrading from an earlier version that cloned shallowly. Such a clone
+      // cannot push to a repository missing the base objects, so deepen it now
+      // rather than discovering that at push time.
+      await unshallowIfNeeded(dir);
+
+      return;
+    }
   }
 
   await gitOrThrow(['init', '--initial-branch', branch], { cwd: dir });
@@ -163,14 +181,39 @@ export async function ensureClone(options: {
   await git(['config', 'user.email', 'ccr-bridge@localhost'], { cwd: dir });
 
   // Fetch the branch if it exists; an empty relay repo is a normal first run.
-  const fetched = await git(
-    ['fetch', 'origin', branch, '--depth', '1'],
-    { cwd: dir, bypassProxy: true, timeoutMs: 60_000 },
-  );
+  //
+  // Deliberately a full fetch, not `--depth 1`. A shallow clone cannot push to
+  // a repository that lacks the base objects, which fails the moment the relay
+  // is emptied or recreated. The relay holds only normalized events, so there is
+  // nothing worth optimising away.
+  const fetched = await git(['fetch', 'origin', branch], {
+    cwd: dir,
+    bypassProxy: true,
+    timeoutMs: 120_000,
+  });
 
   if (fetched.code === 0) {
     await git(['checkout', '-B', branch, 'FETCH_HEAD'], { cwd: dir });
   }
+}
+
+/**
+ * Deepen a shallow clone.
+ *
+ * A shallow repository cannot be pushed to a remote that lacks the omitted
+ * objects — git aborts the push rather than corrupting the history. Recovering
+ * in place is cheaper than discarding the clone.
+ */
+export async function unshallowIfNeeded(dir: string): Promise<boolean> {
+  const shallow = await git(['rev-parse', '--is-shallow-repository'], { cwd: dir });
+  if (shallow.code !== 0 || shallow.stdout.trim() !== 'true') return false;
+
+  const deepened = await git(['fetch', '--unshallow', 'origin'], {
+    cwd: dir,
+    bypassProxy: true,
+    timeoutMs: 300_000,
+  });
+  return deepened.code === 0;
 }
 
 /** Compare two paths for identity, tolerating Windows separators and case. */

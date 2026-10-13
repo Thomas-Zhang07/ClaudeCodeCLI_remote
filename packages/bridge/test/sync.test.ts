@@ -158,6 +158,43 @@ describe('RelaySync', () => {
     );
   });
 
+  it('rewrites a stale remote rather than fetching from the wrong repository', async () => {
+    // Retries with backoff make this slower than the default allowance.
+    // Regression: an existing clone was trusted as long as *some* remote was
+    // configured. Re-pointing CCR_REPO_URL then left the clone fetching from
+    // the old repository while pushing to the new one — which appears to work
+    // and fails confusingly later.
+    const first = await makeSync();
+    await writeChunk('sess-1', '{"seq":1}\n');
+    expect(await first.publish('first')).toBe('pushed');
+
+    // A second, independent relay.
+    const other = join(root, 'other.git');
+    await gitOrThrow(['init', '--bare', '--initial-branch', BRANCH, other], { cwd: root });
+
+    const second = new RelaySync({
+      repoUrl: other,
+      token: null,
+      branch: BRANCH,
+      cloneDir: bridgeClone,
+      outDir,
+    });
+    await second.init();
+
+    const url = await git(['remote', 'get-url', 'origin'], { cwd: bridgeClone });
+    expect(url.stdout.trim()).toBe(other);
+
+    await writeChunk('sess-2', '{"seq":1}\n');
+    expect(existsSync(join(outDir, 'sessions', 'sess-2', 'events-0001.jsonl'))).toBe(true);
+
+    // Also guards the fixed bug: a failed push must never be reported as
+    // 'clean', which would tell the caller there is nothing left to send.
+    expect(await second.publish('second')).toBe('pushed');
+
+    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${BRANCH}`], { cwd: other });
+    expect(tree.stdout).toContain('out/sessions/sess-2/events-0001.jsonl');
+  });
+
   it('reports nothing to do when the tree is unchanged', async () => {
     await writeChunk('sess-1', '{"seq":1}\n');
     const sync = await makeSync();

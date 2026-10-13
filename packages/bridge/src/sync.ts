@@ -79,9 +79,17 @@ export class RelaySync {
       await gitOrThrow(['add', '-A', '--', 'out'], { cwd: cloneDir });
 
       const staged = await git(['diff', '--cached', '--quiet'], { cwd: cloneDir });
-      if (staged.code === 0) return 'clean';
+      const hasStaged = staged.code !== 0;
 
-      await gitOrThrow(['commit', '-m', note], { cwd: cloneDir });
+      if (hasStaged) await gitOrThrow(['commit', '-m', note], { cwd: cloneDir });
+
+      // "Nothing to do" must mean *nothing is missing from the remote* — not
+      // merely "nothing new to commit". A previous attempt may have committed
+      // successfully and then failed to push, in which case the work is sitting
+      // locally and must be retried. Treating that as clean would report success
+      // while the data never left the machine.
+      const ahead = await this.#commitsAhead();
+      if (!hasStaged && !ahead) return 'clean';
 
       const url = authenticatedUrl(this.#options.repoUrl, this.#options.token);
       const pushed = await git(['push', url, `HEAD:${branch}`], {
@@ -94,11 +102,29 @@ export class RelaySync {
 
       // Almost always the phone committing underneath us. Fetch, fast-forward,
       // and try again with the newer history.
-      this.#log(`push rejected (attempt ${attempt + 1}), retrying after fast-forward`);
+      this.#log(
+        `push rejected (attempt ${attempt + 1}): ${pushed.stderr.trim().split('\n').at(-1) ?? ''}`,
+      );
       await sleep(400 * 2 ** attempt + Math.random() * 300);
     }
 
     return 'failed';
+  }
+
+  /**
+   * How many local commits the remote does not have.
+   *
+   * An unresolvable remote ref means we cannot tell, and the safe answer is
+   * "assume there is something to push" — pushing again is harmless, whereas
+   * skipping a push loses data.
+   */
+  async #commitsAhead(): Promise<boolean> {
+    const { branch, cloneDir } = this.#options;
+    const result = await git(['rev-list', '--count', `refs/remotes/origin/${branch}..HEAD`], {
+      cwd: cloneDir,
+    });
+    if (result.code !== 0) return true;
+    return Number.parseInt(result.stdout.trim(), 10) > 0;
   }
 
   /** Bring the local branch up to date with the remote, if it has moved. */
