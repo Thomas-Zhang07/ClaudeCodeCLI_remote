@@ -1,18 +1,17 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { basename, formatDurationMs, relativeTime } from '@/lib/format';
+import { basename, formatDurationMs, formatUSD, relativeTime } from '@/lib/format';
 import { useNow } from '@/lib/now';
-import { closeSession, refreshDetail, relay } from '@/stores/relay';
+import { relay } from '@/stores/relay';
 
 import CostPanel from './CostPanel.vue';
 import PromptComposer from './PromptComposer.vue';
-import StatusPill from './StatusPill.vue';
+import StatusMark from './StatusMark.vue';
 import SubagentTree from './SubagentTree.vue';
 import Timeline from './Timeline.vue';
 
 const props = defineProps<{ sessionId: string }>();
-const emit = defineEmits<{ back: [] }>();
 
 const now = useNow(5_000);
 
@@ -31,6 +30,24 @@ const title = computed(() => {
   return props.sessionId.slice(0, 8);
 });
 
+const where = computed(() => {
+  const project = head.value?.project;
+  if (!project) return props.sessionId;
+  return basename(project);
+});
+
+/** The counter, and the number a torn record is described by. */
+const seq = computed(() => head.value?.lastSeq ?? detail.value?.events.length ?? 0);
+
+/** `claude-sonnet-4-5-20250929` is a serial number, not a name. */
+const model = computed(() => {
+  const raw = head.value?.model ?? detail.value?.summary.model ?? null;
+  if (!raw) return null;
+  return raw.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+});
+
+const lastEventAt = computed(() => detail.value?.summary.lastEventTs ?? null);
+
 const waiting = computed(() => head.value?.status === 'waiting');
 const controllable = computed(() => head.value?.controllable === true);
 /**
@@ -38,8 +55,7 @@ const controllable = computed(() => head.value?.controllable === true);
  * existed, or one that failed to parse, must not be read as permission.
  */
 const injectionEnabled = computed(() => relay.index?.injectionEnabled === true);
-
-const lastEventAt = computed(() => detail.value?.summary.lastEventTs ?? null);
+const canWrite = computed(() => controllable.value && injectionEnabled.value);
 
 const errorAttention = computed(() => {
   const attention = detail.value?.summary.latestAttention;
@@ -47,109 +63,110 @@ const errorAttention = computed(() => {
   return attention;
 });
 
-function goBack(): void {
-  closeSession();
-  emit('back');
+const dropped = computed(() => detail.value?.pruned?.droppedEvents ?? 0);
+
+/**
+ * The composer lives at the foot of a long page, which is the wrong end of it
+ * when the machine is blocked on a person.
+ */
+function toComposer(): void {
+  const field = document.getElementById('composer');
+  if (!field) return;
+  const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  field.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'start' });
+  field.querySelector('textarea')?.focus({ preventScroll: true });
 }
 </script>
 
 <template>
   <div class="detail">
-    <div class="head">
-      <button class="back" type="button" @click="goBack">‹ Sessions</button>
-      <button class="refresh" type="button" :disabled="detail?.loading" @click="refreshDetail()">
-        {{ detail?.loading ? 'Refreshing…' : 'Refresh' }}
-      </button>
-    </div>
-
-    <div class="title-row">
+    <header class="ident">
       <h1>{{ title }}</h1>
-      <StatusPill :status="head?.status ?? 'unknown'" />
-    </div>
-    <p class="sub muted">
-      {{ head?.project ?? props.sessionId }}
-      <template v-if="head?.gitBranch"> · {{ head.gitBranch }}</template>
-    </p>
+      <p class="where">
+        <span class="mono" :title="head?.project ?? props.sessionId">{{ where }}</span>
+        <template v-if="head?.gitBranch">
+          <span class="sep" aria-hidden="true"></span>
+          <span class="mono">{{ head.gitBranch }}</span>
+        </template>
+      </p>
+    </header>
 
-    <!-- The "should I go back to my desk" signal: deliberately the loudest thing
-         on the screen. -->
-    <section v-if="waiting" class="attention-banner">
-      <span class="attention-label">Waiting for you</span>
-      <p class="attention-text">{{ head?.waitingFor || 'The session needs input.' }}</p>
+    <!-- The "should I walk back to my desk" answer. Deliberately the only place
+         the reserved hue is allowed to fill anything. -->
+    <section v-if="waiting" class="urgent">
+      <p class="urgent-kind">waiting on you</p>
+      <p class="urgent-why">{{ head?.waitingFor || 'This session cannot continue without an answer.' }}</p>
+      <button v-if="canWrite" class="urgent-go" type="button" @click="toComposer">write a prompt</button>
     </section>
 
-    <p v-if="errorAttention" class="banner error">
-      <strong>error</strong> {{ errorAttention.text }}
-      <span class="muted"> · {{ relativeTime(errorAttention.ts, now) }}</span>
-    </p>
+    <section v-if="errorAttention" class="cond fault">
+      <p class="cond-kind">error</p>
+      <p class="cond-text">
+        {{ errorAttention.text }}
+        <span class="mono">{{ relativeTime(errorAttention.ts, now) }}</span>
+      </p>
+    </section>
 
-    <p v-if="detail?.resyncing" class="banner warn">
-      Resyncing — a chunk could not be read cleanly. Showing everything before the break; the next
-      poll will refetch it.
-    </p>
+    <!-- A chunk that will not read. Repairable, so it is not dressed as damage. -->
+    <section v-if="detail?.resyncing" class="cond">
+      <p class="cond-kind">resyncing</p>
+      <p class="cond-text">
+        A chunk came back unreadable. It is being refetched; everything before the break is shown.
+      </p>
+    </section>
 
-    <p v-else-if="detail?.gap" class="banner error">
-      Stream gap after event #{{ detail.gap.afterSeq }} ({{ detail.gap.reason }}). Later events are
-      withheld rather than shown out of order.
-    </p>
+    <!-- A hole that cannot be repaired by asking again. -->
+    <section v-else-if="detail?.gap" class="cond fault">
+      <p class="cond-kind">stream gap</p>
+      <p class="cond-text">
+        The record jumps after event #{{ detail.gap.afterSeq }} ({{ detail.gap.reason }}). Later
+        events are withheld rather than shown out of order.
+      </p>
+    </section>
 
-    <!-- Catching up after the phone was asleep: many chunks are missing at once,
-         so they are fetched a few at a time rather than in one burst. Ordinary,
-         and only shown while more than the newest chunk is outstanding. -->
-    <p v-else-if="detail?.inFlight" class="banner neutral">
-      Loading {{ detail.pendingChunks.length }} more chunks — a few at a time, so a catch-up does
-      not trip the API's rate limit.
-    </p>
+    <!-- Catching up after the phone was asleep. Ordinary, and it heals itself. -->
+    <section v-else-if="detail?.inFlight" class="cond">
+      <p class="cond-kind">catching up</p>
+      <p class="cond-text">
+        Fetching {{ detail.pendingChunks.length }} more chunks a few at a time, so a catch-up does
+        not trip Gitee's rate limit.
+      </p>
+    </section>
 
-    <!-- Retention, not damage: deliberately styled apart from a gap. -->
-    <p v-if="detail?.pruned" class="banner info">
-      Earlier history not retained.
-      <template v-if="detail.pruned.droppedEvents > 0">
-        The relay keeps a rolling window, and {{ detail.pruned.droppedEvents }} earlier event(s) have
-        been dropped.
-      </template>
-      The stream is complete from here on.
-    </p>
+    <section v-if="detail?.error" class="cond fault">
+      <p class="cond-kind">cannot read this session</p>
+      <p class="cond-text">{{ detail.error }}</p>
+    </section>
 
-    <p v-if="detail?.error" class="banner error">{{ detail.error }}</p>
+    <!-- The instrument face. Four readings in a fixed order, learned once; the
+         two stream counters that were here died because nobody can act on a
+         chunk count while everything is fine. -->
+    <section class="face">
+      <div class="face-head">
+        <StatusMark :status="head?.status ?? 'unknown'" />
+        <span v-if="model" class="model mono">{{ model }}</span>
+      </div>
 
-    <!-- Activity strip -->
-    <section class="card strip">
-      <div class="cell">
-        <span class="label">model</span>
-        <span class="value">{{ head?.model ?? detail?.summary.model ?? '—' }}</span>
-      </div>
-      <div class="cell">
-        <span class="label">status</span>
-        <span class="value">{{ head?.status ?? 'unknown' }}</span>
-      </div>
-      <div class="cell">
-        <span class="label">last event</span>
-        <span class="value">{{ lastEventAt ? relativeTime(lastEventAt, now) : '—' }}</span>
-      </div>
-      <div class="cell">
-        <span class="label">last turn</span>
-        <span class="value">
-          <template v-if="detail?.summary.lastTurnEnd">
-            {{ formatDurationMs(detail.summary.lastTurnEnd.durationMs) }} ·
-            {{ detail.summary.lastTurnEnd.messageCount }} msg
-          </template>
-          <template v-else>—</template>
-        </span>
-      </div>
-      <div class="cell">
-        <span class="label">chunks</span>
-        <span class="value">
-          {{ detail?.chunksLoaded ?? 0 }}<template v-if="(detail?.chunksTotal ?? 0) > 0">/{{ detail?.chunksTotal }}</template>
-          <template v-if="(detail?.pendingChunks.length ?? 0) > 0">
-            · {{ detail?.pendingChunks.length }} pending
-          </template>
-        </span>
-      </div>
-      <div class="cell">
-        <span class="label">events</span>
-        <span class="value">{{ detail?.events.length ?? 0 }}</span>
-      </div>
+      <dl class="rail">
+        <div>
+          <dt>seq</dt>
+          <dd>{{ seq }}</dd>
+        </div>
+        <div>
+          <dt>last</dt>
+          <dd :class="{ quiet: !lastEventAt }">{{ lastEventAt ? relativeTime(lastEventAt, now) : '—' }}</dd>
+        </div>
+        <div>
+          <dt>turn</dt>
+          <dd :class="{ quiet: !detail?.summary.lastTurnEnd }">
+            {{ detail?.summary.lastTurnEnd ? formatDurationMs(detail.summary.lastTurnEnd.durationMs) : '—' }}
+          </dd>
+        </div>
+        <div>
+          <dt>cost</dt>
+          <dd :class="{ quiet: !head?.cost }">{{ head?.cost ? formatUSD(head.cost.totalCostUSD) : '—' }}</dd>
+        </div>
+      </dl>
     </section>
 
     <Timeline
@@ -157,6 +174,7 @@ function goBack(): void {
       :events="detail.events"
       :now="now"
       :gaps-after-seq="detail.gap ? detail.gap.afterSeq : null"
+      :dropped-events="dropped"
     />
 
     <SubagentTree v-if="detail && detail.subagents.length > 0" :nodes="detail.subagents" />
@@ -164,6 +182,7 @@ function goBack(): void {
     <CostPanel :cost="head?.cost" />
 
     <PromptComposer
+      id="composer"
       :session-id="props.sessionId"
       :controllable="controllable"
       :injection-enabled="injectionEnabled"
@@ -175,136 +194,198 @@ function goBack(): void {
 .detail {
   display: flex;
   flex-direction: column;
-  gap: 12px;
   min-width: 0;
 }
 
-.head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
+/* --- identity ------------------------------------------------------------- */
 
-.back,
-.refresh {
-  min-height: var(--tap);
-  padding: 8px 14px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface);
-  cursor: pointer;
-  font-size: 14px;
-}
-
-.refresh {
-  margin-left: auto;
-}
-
-.title-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.ident {
+  padding: 16px 0 0;
   min-width: 0;
 }
 
 h1 {
-  font-size: 19px;
   margin: 0;
-  overflow-wrap: anywhere;
-}
-
-.sub {
-  margin: -6px 0 0;
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.attention-banner {
-  border-radius: var(--radius);
-  padding: 14px;
-  border: 1px solid var(--wait);
-  background: color-mix(in srgb, var(--wait) 18%, var(--surface));
-}
-
-.attention-label {
-  display: inline-block;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--wait);
-  font-weight: 700;
-}
-
-.attention-text {
-  margin: 4px 0 0;
-  font-size: 16px;
+  font-size: 21px;
+  line-height: 1.25;
   font-weight: 600;
+  letter-spacing: -0.01em;
   overflow-wrap: anywhere;
 }
 
-.banner {
+.where {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.sep {
+  width: 1px;
+  height: 11px;
+  background: var(--rule-strong);
+  flex: none;
+}
+
+/* --- the band that fills -------------------------------------------------- */
+
+.urgent {
+  margin: 14px 0 0;
+  padding: 11px 12px 12px;
+  background: var(--plate);
+  border-left: 3px solid var(--signal);
+}
+
+.urgent-kind {
   margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--signal);
+}
+
+.urgent-why {
+  margin: 3px 0 0;
+  font-size: 17px;
+  line-height: 1.35;
+  font-weight: 500;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  max-width: var(--measure);
+}
+
+.urgent-go {
+  margin-top: 6px;
+  min-height: var(--tap);
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--signal);
+  border-bottom: 1px solid var(--signal);
+}
+
+/* --- conditions ----------------------------------------------------------- */
+
+.cond {
+  margin: 12px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--rule-strong);
+  max-width: var(--measure);
+}
+
+.cond-kind {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+}
+
+.cond-text {
+  margin: 2px 0 0;
   font-size: 13px;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
+  line-height: 1.5;
+  color: var(--ink-2);
   overflow-wrap: anywhere;
 }
 
-.banner.warn {
-  border: 1px solid color-mix(in srgb, var(--wait) 45%, var(--border));
-  color: var(--wait);
-  background: color-mix(in srgb, var(--wait) 10%, transparent);
+.cond.fault {
+  border-left-color: var(--fault);
 }
 
-.banner.error {
-  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
-  color: var(--danger);
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
+.cond.fault .cond-kind,
+.cond.fault .cond-text {
+  color: var(--fault);
 }
 
-/* Not a warning: something is still in flight, and it will resolve itself. */
-.banner.neutral {
-  border: 1px solid var(--border);
-  color: var(--muted);
-  background: var(--surface-2);
+/* --- the face ------------------------------------------------------------- */
+
+.face {
+  margin: 16px 0 0;
+  border-top: 1px solid var(--rule-strong);
+  border-bottom: 1px solid var(--rule-strong);
 }
 
-/* Retention, which is a plain fact rather than a fault — kept visually distinct
-   from the red of a sequence gap. */
-.banner.info {
-  border: 1px solid color-mix(in srgb, var(--info) 40%, var(--border));
-  color: var(--info);
-  background: color-mix(in srgb, var(--info) 10%, transparent);
+.face-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 0 8px;
+  border-bottom: 1px solid var(--rule);
 }
 
-.strip {
+.model {
+  font-size: 12px;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+
+.rail {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
-  padding: 12px;
+  margin: 0;
+}
+
+.rail > div {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px 0;
+}
+
+/* The hairline between readings is the engraved division on a dial. */
+.rail > div:nth-child(even) {
+  padding-left: 12px;
+  border-left: 1px solid var(--rule);
+}
+
+.rail > div:nth-child(n + 3) {
+  border-top: 1px solid var(--rule);
+}
+
+dt {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  flex: none;
+}
+
+dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums slashed-zero;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+dd.quiet {
+  color: var(--ink-2);
+  opacity: 0.6;
 }
 
 @media (min-width: 480px) {
-  .strip {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+  .rail {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
-}
 
-.cell {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
+  .rail > div:nth-child(n + 3) {
+    border-top: none;
+  }
 
-.label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-}
-
-.value {
-  font-size: 13px;
-  overflow-wrap: anywhere;
+  .rail > div:nth-child(n + 2) {
+    padding-left: 12px;
+    border-left: 1px solid var(--rule);
+  }
 }
 </style>

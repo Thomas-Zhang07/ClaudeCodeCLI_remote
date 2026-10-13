@@ -64,7 +64,9 @@ export function shortPath(path: string, maxSegments = 2): string {
 }
 
 export function basename(path: string): string {
-  const parts = path.split('/');
+  // Split on both separators: a session's `project` is a cwd, and on Windows
+  // that is a backslash path.
+  const parts = path.split(/[/\\]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
 }
 

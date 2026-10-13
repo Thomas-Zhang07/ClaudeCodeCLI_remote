@@ -99,31 +99,34 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
-    <header class="topbar">
-      <h1 class="brand">CC Remote</h1>
-      <button class="settings-btn" type="button" @click="toggleSettings">
-        {{ view === 'settings' ? 'Close' : 'Settings' }}
+    <!-- One strip of chrome, not two. What the machine is doing is the most
+         useful thing to keep on screen, so it rides with the navigation. -->
+    <header class="masthead">
+      <button
+        v-if="effectiveView === 'detail'"
+        class="ghost back"
+        type="button"
+        aria-label="Back to sessions"
+        @click="showList"
+      >
+        <span aria-hidden="true">‹</span>
+      </button>
+      <span v-else class="wordmark">cc remote</span>
+
+      <ConnectionBar />
+
+      <button class="ghost settings" type="button" :aria-pressed="effectiveView === 'settings'" @click="toggleSettings">
+        {{ effectiveView === 'settings' ? 'close' : 'setup' }}
       </button>
     </header>
 
-    <ConnectionBar />
-
     <main class="content">
-      <SettingsScreen v-if="effectiveView === 'settings'" @done="showList" />
+      <SettingsScreen v-if="effectiveView === 'settings'" />
 
-      <SessionDetail
-        v-else-if="effectiveView === 'detail' && relay.activeSessionId"
-        :session-id="relay.activeSessionId"
-        @back="showList"
-      />
+      <SessionDetail v-else-if="effectiveView === 'detail' && relay.activeSessionId" :session-id="relay.activeSessionId" />
 
       <SessionList v-else @open="showSession" />
     </main>
-
-    <p class="footnote muted">
-      Read-only monitoring needs nothing configured on this phone beyond the token.
-      <span v-if="relay.index">Updated {{ relay.index.generatedAt }}</span>
-    </p>
   </div>
 </template>
 
@@ -134,45 +137,52 @@ onUnmounted(() => {
   min-height: 100vh;
 }
 
-.topbar {
+.masthead {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px calc(10px + env(safe-area-inset-top, 0px));
-  background: var(--surface);
+  gap: 2px;
+  padding: calc(2px + env(safe-area-inset-top, 0px)) 6px 2px;
+  background: var(--plate);
+  border-bottom: 1px solid var(--rule);
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
-.brand {
-  font-size: 16px;
-  margin: 0;
-  letter-spacing: 0.02em;
+.wordmark {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  padding: 0 6px 0 8px;
+  white-space: nowrap;
 }
 
-.settings-btn {
-  margin-left: auto;
-  min-height: 36px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  font-size: 13px;
-  cursor: pointer;
+.back span {
+  font-size: 22px;
+  line-height: 1;
+}
+
+/* The connection bar takes the middle and absorbs the slack; the two controls
+   at the ends are fixed. */
+.masthead :deep(.bar) {
+  flex: 1;
+  min-width: 0;
+  border-bottom: none;
+  background: none;
+  padding: 0;
+}
+
+.settings {
+  font-size: 12px;
+  font-family: var(--mono);
 }
 
 .content {
   flex: 1;
-  padding: 14px;
-  max-width: 720px;
+  padding: 0 var(--page-pad) 32px;
+  max-width: 600px;
   width: 100%;
   margin: 0 auto;
   min-width: 0;
-}
-
-.footnote {
-  font-size: 11px;
-  text-align: center;
-  padding: 8px 14px calc(12px + env(safe-area-inset-bottom, 0px));
-  margin: 0;
-  overflow-wrap: anywhere;
 }
 </style>

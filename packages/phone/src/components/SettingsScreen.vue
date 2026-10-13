@@ -4,17 +4,8 @@ import { computed, ref } from 'vue';
 import { blobCache } from '@/lib/cache';
 import { webCryptoAvailable } from '@/lib/hmac';
 import { useNow } from '@/lib/now';
-import {
-  POLL_MAX_MS,
-  POLL_MIN_MS,
-  clearSettings,
-  isConfigured,
-  saveSettings,
-  settings,
-} from '@/lib/settings';
+import { POLL_MAX_MS, POLL_MIN_MS, clearSettings, saveSettings, settings } from '@/lib/settings';
 import { refreshNow, relay, onSettingsChanged, throttledForMs } from '@/stores/relay';
-
-const emit = defineEmits<{ done: [] }>();
 
 const now = useNow(1000);
 const owner = ref(settings.owner);
@@ -36,6 +27,7 @@ const dirty = computed(
 
 const cacheLabel = computed(() => `${blobCache.size} files (${Math.round(blobCache.approxBytes / 1024)} KB)`);
 const backoff = computed(() => throttledForMs(now.value));
+const cryptoOk = webCryptoAvailable();
 
 function save(): void {
   saveSettings({
@@ -66,12 +58,14 @@ function clearCache(): void {
 
 <template>
   <div class="settings">
-    <div class="head">
+    <header class="ident">
       <h1>Settings</h1>
-      <button v-if="isConfigured" class="btn" type="button" @click="emit('done')">Done</button>
-    </div>
+      <p class="where">This phone reads the relay repository and nothing else.</p>
+    </header>
 
-    <section class="card warn-card">
+    <!-- Loud by structure rather than by hue: the token is a shell on the PC,
+         and that deserves weight, not a colour that means something else. -->
+    <section class="caution">
       <h2>Before you paste a token</h2>
       <ul>
         <li>
@@ -82,23 +76,26 @@ function clearCache(): void {
           <strong>A prompt written there runs as a command on the PC.</strong> The bridge injects it
           straight into a Claude Code session, so treat repo write access as equivalent to shell
           access on that machine. The signature only proves the prompt came from someone holding the
-          shared secret — it is not a sandbox.
+          shared secret. It is not a sandbox.
         </li>
-        <li>Scope the token to this one private repository, and give it the narrowest permissions that work.</li>
-        <li>Rotate the token (and the shared secret) immediately if this phone is lost.</li>
+        <li>
+          Scope the token to this one private repository, and give it the narrowest permissions that
+          work.
+        </li>
+        <li>Rotate the token and the shared secret immediately if this phone is lost.</li>
         <li>Prefer a private repository: relay files are readable by anyone with repo access.</li>
       </ul>
     </section>
 
-    <section v-if="!webCryptoAvailable()" class="card warn-card">
-      <h2>Insecure origin</h2>
-      <p class="muted">
+    <section v-if="!cryptoOk" class="cond fault">
+      <p class="cond-kind">insecure origin</p>
+      <p class="cond-text">
         Web Crypto is unavailable here, so prompts cannot be signed or verified and chunks cannot be
-        checksummed. Serve this app over https:// (or open it on localhost) to enable sending.
+        checksummed. Serve this app over https://, or open it on localhost, to enable sending.
       </p>
     </section>
 
-    <section class="card form">
+    <section class="form">
       <label>
         <span>Owner</span>
         <input v-model="owner" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="gitee username" />
@@ -125,7 +122,7 @@ function clearCache(): void {
       </button>
 
       <label>
-        <span>Shared secret (CCR_SECRET on the PC)</span>
+        <span>Shared secret, the PC's <code>CCR_SECRET</code></span>
         <input
           v-model="secret"
           type="password"
@@ -137,59 +134,69 @@ function clearCache(): void {
       </label>
 
       <label>
-        <span>Active session poll interval — {{ pollSeconds }}s</span>
-        <input v-model.number="pollSeconds" type="range" :min="POLL_MIN_MS / 1000" :max="POLL_MAX_MS / 1000" step="5" />
+        <span>Active session poll interval, every {{ pollSeconds }}s</span>
+        <input
+          v-model.number="pollSeconds"
+          type="range"
+          :min="POLL_MIN_MS / 1000"
+          :max="POLL_MAX_MS / 1000"
+          step="5"
+        />
       </label>
 
-      <p class="muted small">
-        This is how often the head of a session that is working is polled. The session list and any
-        idle session are polled every 60s, and polling stops entirely while the app is in the
-        background. The bridge publishes on turn boundaries, so faster polling mostly returns
-        unchanged files — which still cost Gitee quota.
+      <p class="note">
+        How often a session that is working has its head polled. The session list, and any idle
+        session, are polled every 60s, and polling stops entirely while the app is in the background.
+        The bridge publishes on turn boundaries, so faster polling mostly returns unchanged files,
+        which still cost Gitee quota.
       </p>
 
-      <button class="btn btn-primary" type="button" :disabled="!dirty" @click="save">
+      <button class="btn btn-primary save" type="button" :disabled="!dirty" @click="save">
         {{ dirty ? 'Save' : 'Saved' }}
       </button>
 
-      <p v-if="saved && !dirty" class="ok small">Saved.</p>
-      <p v-if="!blobCache.persisted" class="warn small">
-        The local cache could not be written (private browsing, or storage full). The app still
-        works; it just re-fetches after a reload.
+      <p v-if="saved && !dirty" class="note">Saved. The relay is being re-read now.</p>
+      <p v-if="!blobCache.persisted" class="cond fault">
+        The local cache could not be written, most likely private browsing or a full disk. The app
+        still works; it just re-fetches everything after a reload.
       </p>
     </section>
 
-    <section class="card">
-      <h2>Status</h2>
-      <dl class="status">
+    <section class="status">
+      <h2>Relay</h2>
+      <dl>
         <div>
-          <dt>Relay</dt>
-          <dd>{{ relay.index ? `${relay.index.sessions.length} session(s)` : relay.empty ? 'empty' : '—' }}</dd>
+          <dt>sessions published</dt>
+          <dd>{{ relay.index ? relay.index.sessions.length : relay.empty ? 0 : '—' }}</dd>
         </div>
         <div>
-          <dt>Last success</dt>
+          <dt>last successful read</dt>
           <dd>{{ relay.lastSuccessAt ? new Date(relay.lastSuccessAt).toLocaleTimeString() : 'never' }}</dd>
         </div>
         <div>
-          <dt>Last poll</dt>
+          <dt>last attempt</dt>
           <dd>{{ relay.lastPollAt ? new Date(relay.lastPollAt).toLocaleTimeString() : 'never' }}</dd>
         </div>
         <div>
-          <dt>Cached files</dt>
+          <dt>files held on this phone</dt>
           <dd>{{ cacheLabel }}</dd>
         </div>
       </dl>
 
-      <p v-if="backoff > 0" class="warn small">
-        Throttled by Gitee. Next attempt in {{ Math.ceil(backoff / 1000) }}s.
+      <p v-if="backoff > 0" class="cond fault">
+        Gitee is throttling this phone. Next attempt in {{ Math.ceil(backoff / 1000) }}s.
         <template v-if="relay.error">Last error: {{ relay.error }}</template>
       </p>
-      <p v-else-if="relay.error" class="warn small">{{ relay.error }}</p>
+      <p v-else-if="relay.error" class="cond fault">{{ relay.error }}</p>
 
       <div class="actions">
-        <button class="btn" type="button" @click="clearCache">Clear cache</button>
+        <button class="btn" type="button" @click="clearCache">Clear the cache</button>
         <button class="btn" type="button" @click="reset">Forget everything</button>
       </div>
+      <p class="note">
+        Clearing the cache re-fetches every chunk on the next read. Forgetting everything also drops
+        the token and the shared secret.
+      </p>
     </section>
   </div>
 </template>
@@ -198,116 +205,188 @@ function clearCache(): void {
 .settings {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  min-width: 0;
 }
 
-.head {
-  display: flex;
-  align-items: center;
+.ident {
+  padding: 16px 0 0;
 }
 
 h1 {
-  font-size: 20px;
   margin: 0;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
-.head .btn {
-  margin-left: auto;
+.where {
+  margin: 5px 0 0;
+  font-size: 13px;
+  color: var(--ink-2);
 }
 
 h2 {
-  font-size: 14px;
   margin: 0 0 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--ink-2);
 }
 
-.warn-card {
-  border-color: color-mix(in srgb, var(--wait) 45%, var(--border));
-  background: color-mix(in srgb, var(--wait) 8%, var(--surface));
+/* --- the caution ---------------------------------------------------------- */
+
+.caution {
+  margin: 16px 0 0;
+  padding: 12px 12px 14px;
+  background: var(--plate);
+  border-left: 3px solid var(--ink);
 }
 
-.warn-card ul {
+.caution h2 {
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.caution ul {
   margin: 0;
-  padding-left: 18px;
+  padding-left: 16px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
   font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  max-width: var(--measure);
 }
+
+.caution strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* --- form ----------------------------------------------------------------- */
 
 .form {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--rule-strong);
 }
 
 label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
 }
 
 label > span {
   font-size: 12px;
-  color: var(--muted);
+  color: var(--ink-2);
 }
 
-.form .btn-primary {
-  margin-top: 4px;
+label > span code {
+  color: var(--ink);
+}
+
+input[type='range'] {
+  accent-color: var(--ink);
+  padding: 0;
+  border: none;
+  background: none;
+  min-height: var(--tap);
 }
 
 .reveal {
   align-self: flex-start;
-  background: none;
-  border: none;
-  color: var(--accent);
-  font-size: 13px;
+  min-height: var(--tap);
+  margin-top: -12px;
   padding: 0;
-  margin-top: -6px;
-  min-height: 32px;
+  border: none;
+  border-bottom: 1px solid var(--rule-strong);
+  background: none;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 11px;
   cursor: pointer;
 }
 
-.small {
-  font-size: 12px;
+.reveal:hover {
+  color: var(--ink);
+}
+
+.save {
+  align-self: flex-start;
+  min-width: 120px;
+  margin-top: 2px;
+}
+
+.note {
   margin: 0;
+  max-width: var(--measure);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--ink-2);
 }
 
-.ok {
-  color: var(--accent);
+.cond {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--rule-strong);
+  max-width: var(--measure);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
 }
 
-.warn {
-  color: var(--wait);
+.cond.fault {
+  border-left-color: var(--fault);
+  color: var(--fault);
 }
+
+/* --- readout -------------------------------------------------------------- */
 
 .status {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--rule-strong);
+}
+
+dl {
   margin: 0;
+}
+
+dl > div {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px solid var(--rule);
 }
 
 dt {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
+  font-size: 12px;
+  color: var(--ink-2);
 }
 
 dd {
-  margin: 2px 0 0;
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-
-dd.mono {
+  margin: 0 0 0 auto;
   font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 .actions {
   display: flex;
-  gap: 8px;
-  margin-top: 12px;
   flex-wrap: wrap;
+  gap: 8px;
+  margin: 14px 0 10px;
 }
 </style>

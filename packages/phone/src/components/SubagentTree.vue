@@ -27,6 +27,7 @@ const roots = computed<SubagentNode[]>(() => {
 });
 
 const total = computed(() => flatten(props.nodes).length);
+const running = computed(() => flatten(props.nodes).filter((node) => node.status === 'running').length);
 
 function flatten(nodes: readonly SubagentNode[]): SubagentNode[] {
   const out: SubagentNode[] = [];
@@ -43,13 +44,14 @@ function flatten(nodes: readonly SubagentNode[]): SubagentNode[] {
 </script>
 
 <template>
-  <section class="card tree">
-    <header class="head">
-      <h2>Agents</h2>
-      <span class="muted count">{{ total }}</span>
-    </header>
-    <p v-if="total === 0" class="muted empty">No subagents in this session.</p>
-    <ul v-else class="roots">
+  <section class="tree">
+    <p class="head">
+      <span class="label">agents</span>
+      <span class="count">{{ total }}</span>
+      <span v-if="running > 0" class="live">{{ running }} still running</span>
+    </p>
+
+    <ul class="roots">
       <SubagentBranch v-for="node in roots" :key="node.agentId || node.toolUseId" :node="node" :depth="0" />
     </ul>
   </section>
@@ -57,31 +59,34 @@ function flatten(nodes: readonly SubagentNode[]): SubagentNode[] {
 
 <style scoped>
 .tree {
-  padding: 10px 8px;
+  margin-top: 24px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule-strong);
 }
 
 .head {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  padding: 0 4px 4px;
+  margin: 0 0 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
 }
 
-h2 {
-  font-size: 13px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin: 0;
+.label {
+  color: var(--ink-2);
 }
 
 .count {
+  color: var(--ink);
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
-.empty {
-  font-size: 13px;
-  margin: 4px;
+.live {
+  margin-left: auto;
+  color: var(--ink);
 }
 
 .roots {

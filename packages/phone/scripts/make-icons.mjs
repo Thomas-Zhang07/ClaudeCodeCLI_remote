@@ -16,9 +16,11 @@ import { fileURLToPath } from 'node:url';
 
 const OUT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
 
-const BG = [0x10, 0x10, 0x14];
-const ACCENT = [0x7d, 0xd3, 0xa7];
-const DIM = [0x8a, 0x8f, 0x9a];
+// The same six tokens the app uses, in their dark values.
+const BG = [0x17, 0x1a, 0x18];
+const INK = [0xdf, 0xe3, 0xd7];
+const RULE = [0x4b, 0x54, 0x49];
+const SIGNAL = [0xe0, 0xa3, 0x3c];
 
 function crc32(buf) {
   let c = 0xffffffff;
@@ -63,7 +65,11 @@ function png(size, pixels) {
   ]);
 }
 
-/** A `>_` prompt glyph on a rounded dark tile. */
+/**
+ * A strip of chart tape: one channel rule with three event marks on it, the
+ * middle one carrying the reserved hue. Three marks read at 192px; the `>_`
+ * prompt glyph it replaces read as a terminal emulator, which this is not.
+ */
 function draw(size) {
   const px = Buffer.alloc(size * size * 3);
   const radius = size * 0.22;
@@ -84,37 +90,29 @@ function draw(size) {
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       if (inTile(x + 0.5, y + 0.5)) put(x, y, BG);
-      else put(x, y, [0x0a, 0x0a, 0x0d]);
+      else put(x, y, [0x0b, 0x0d, 0x0c]);
     }
   }
 
-  const stroke = Math.max(2, Math.round(size * 0.055));
-  const paint = (x, y, color) => {
-    for (let dy = 0; dy < stroke; dy++) for (let dx = 0; dx < stroke; dx++) put(x + dx, y + dy, color);
+  // Every mark is axis-aligned, so a rectangle is the whole vocabulary.
+  const rect = (x, y, w, h, color) => {
+    for (let dy = 0; dy < h; dy++) {
+      for (let dx = 0; dx < w; dx++) put(Math.round(x + dx), Math.round(y + dy), color);
+    }
   };
 
-  // Chevron `>`.
-  const x0 = Math.round(size * 0.22);
-  const yMid = Math.round(size * 0.5);
-  const arm = Math.round(size * 0.2);
-  for (let t = 0; t <= arm; t++) {
-    const yTop = yMid - arm + t;
-    const yBot = yMid + arm - t;
-    for (let d = 0; d < stroke; d++) {
-      const x = x0 + t;
-      // Thickness applied perpendicular-ish by stacking rows.
-      for (let k = -Math.floor(stroke / 2); k <= Math.floor(stroke / 2); k++) {
-        put(x, yTop + k, ACCENT);
-        put(x, yBot + k, ACCENT);
-      }
-    }
-  }
+  const unit = Math.max(2, Math.round(size * 0.032));
+  const ruleX = size * 0.34;
+  const top = size * 0.19;
+  const height = size * 0.62;
 
-  // Underscore.
-  const ux = Math.round(size * 0.52);
-  const uw = Math.round(size * 0.28);
-  const uy = Math.round(size * 0.72);
-  for (let x = ux; x < ux + uw; x++) for (let d = 0; d < stroke; d++) put(x, uy + d, DIM);
+  // The channel.
+  rect(ruleX, top, unit, height, RULE);
+
+  // Three marks off it, the middle one the loudest.
+  rect(ruleX, size * 0.27, size * 0.28, unit, INK);
+  rect(ruleX, size * 0.465, size * 0.36 + unit, Math.round(unit * 1.8), SIGNAL);
+  rect(ruleX, size * 0.68, size * 0.2, unit, INK);
 
   return px;
 }

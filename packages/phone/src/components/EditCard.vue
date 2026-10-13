@@ -11,6 +11,8 @@ const open = ref(false);
 
 interface DiffLine {
   kind: 'add' | 'del' | 'meta' | 'context';
+  /** The proofreader's mark in the margin — the diff's primary channel. */
+  mark: string;
   text: string;
   key: number;
 }
@@ -18,13 +20,19 @@ interface DiffLine {
 const lines = computed<DiffLine[]>(() => {
   const patch = props.event.patch;
   if (!patch) return [];
-  return patch.split('\n').map((text, key) => {
+  return patch.split('\n').map((raw, key) => {
     let kind: DiffLine['kind'] = 'context';
-    if (text.startsWith('@@')) kind = 'meta';
-    else if (text.startsWith('+++') || text.startsWith('---')) kind = 'meta';
-    else if (text.startsWith('+')) kind = 'add';
-    else if (text.startsWith('-')) kind = 'del';
-    return { kind, text, key };
+    // A leading `+`/`-` on a `+++`/`---` header is a filename, not a change.
+    if (raw.startsWith('@@') || raw.startsWith('+++') || raw.startsWith('---')) kind = 'meta';
+    else if (raw.startsWith('+')) kind = 'add';
+    else if (raw.startsWith('-')) kind = 'del';
+    const marked = kind === 'add' || kind === 'del';
+    return {
+      kind,
+      mark: kind === 'add' ? '+' : kind === 'del' ? '−' : ' ',
+      text: marked ? raw.slice(1) : raw,
+      key,
+    };
   });
 });
 
@@ -36,169 +44,183 @@ const dirLabel = computed(() => {
   parts.pop();
   return parts.length > 0 ? `${parts.join('/')}/` : '';
 });
+
+/**
+ * Only the tools that change the shape of the file get a word. A plain `Edit`
+ * is the default and says nothing.
+ */
+const toolNote = computed(() => {
+  if (props.event.created) return 'new file';
+  if (props.event.tool === 'Edit') return null;
+  return props.event.tool === 'NotebookEdit' ? 'notebook' : 'whole file';
+});
+
+const addedLabel = computed(() => (props.event.added ? `+${props.event.added}` : null));
+const removedLabel = computed(() => (props.event.removed ? `−${props.event.removed}` : null));
 </script>
 
 <template>
-  <div class="edit card">
+  <div class="edit">
     <button class="head" type="button" :aria-expanded="open" @click="open = !open">
-      <span class="chevron" :class="{ open }">›</span>
+      <span class="caret" :class="{ open }" aria-hidden="true">›</span>
+
       <span class="paths">
         <span class="file">{{ fileLabel }}</span>
         <span v-if="dirLabel" class="dir">{{ dirLabel }}</span>
       </span>
-      <span class="stats">
-        <span v-if="event.created" class="badge new">new file</span>
-        <span class="tool">{{ event.tool }}</span>
-        <span v-if="event.added" class="add">+{{ event.added }}</span>
-        <span v-if="event.removed" class="del">−{{ event.removed }}</span>
+
+      <span v-if="toolNote" class="note">{{ toolNote }}</span>
+
+      <span class="counts">
+        <span v-if="addedLabel" class="count add">{{ addedLabel }}</span>
+        <span v-if="removedLabel" class="count del">{{ removedLabel }}</span>
       </span>
     </button>
 
     <div v-if="open" class="body">
-      <p v-if="!hasDiff" class="muted small">
-        No diff was published for this edit (whole-file write, or truncated at the source).
+      <p v-if="!hasDiff" class="quiet">
+        No diff was published for this edit. That happens on a whole-file write, or when the patch
+        was cut at the source.
       </p>
       <pre v-else class="diff"><code><span
             v-for="line in lines"
             :key="line.key"
             class="line"
             :class="line.kind"
-          >{{ line.text }}</span></code></pre>
+          ><span class="mark" aria-hidden="true">{{ line.mark }}</span>{{ line.text }}</span></code></pre>
     </div>
   </div>
 </template>
 
 <style scoped>
 .edit {
-  padding: 0;
-  overflow: hidden;
+  max-width: var(--measure);
 }
 
 .head {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   width: 100%;
   min-height: var(--tap);
-  padding: 8px 10px;
+  padding: 4px 0;
   background: none;
   border: none;
   text-align: left;
   cursor: pointer;
 }
 
-.head:active {
-  background: var(--surface-2);
-}
-
-.chevron {
-  display: inline-block;
-  color: var(--muted);
-  transition: transform 0.15s ease;
-  font-size: 20px;
+.caret {
+  align-self: center;
+  flex: none;
+  font-size: 16px;
   line-height: 1;
+  color: var(--ink-2);
+  transition: transform 0.15s ease;
 }
 
-.chevron.open {
+.caret.open {
   transform: rotate(90deg);
 }
 
 .paths {
-  min-width: 0;
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 6px;
+  min-width: 0;
 }
 
 .file {
   font-family: var(--mono);
   font-size: 13px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 52vw;
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 .dir {
-  color: var(--muted);
+  font-family: var(--mono);
   font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 52vw;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
 }
 
-.stats {
+.note {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.counts {
   margin-left: auto;
   display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.tool {
-  color: var(--muted);
-}
-
-.badge {
-  border-radius: 999px;
-  padding: 1px 6px;
+  gap: 8px;
+  flex: none;
+  font-family: var(--mono);
   font-size: 11px;
-  border: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
 }
 
-.badge.new {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+.count.add {
+  color: var(--add-ink);
 }
 
-.add {
-  color: var(--add);
-}
-
-.del {
-  color: var(--del);
+.count.del {
+  color: var(--fault);
 }
 
 .body {
-  border-top: 1px solid var(--border);
-  padding: 8px 10px 10px;
+  margin-top: 2px;
+  border-left: 2px solid var(--rule);
+  padding-left: 8px;
 }
 
-.small {
-  font-size: 13px;
+.quiet {
   margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
 }
 
 .diff {
-  max-height: 45vh;
+  max-height: 46vh;
   overflow: auto;
   font-size: 12px;
-  line-height: 1.5;
+  line-height: 1.55;
 }
 
 .line {
   display: block;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  color: var(--ink-2);
+}
+
+/* The mark in the margin is what tells a line apart; the tint only helps. */
+.mark {
+  color: var(--rule-strong);
 }
 
 .line.add {
-  color: var(--add);
-  background: color-mix(in srgb, var(--add) 10%, transparent);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--add-ink) 10%, transparent);
+}
+
+.line.add .mark {
+  color: var(--add-ink);
 }
 
 .line.del {
-  color: var(--del);
-  background: color-mix(in srgb, var(--del) 10%, transparent);
+  color: var(--ink-2);
+  background: color-mix(in srgb, var(--fault) 10%, transparent);
+}
+
+.line.del .mark {
+  color: var(--fault);
 }
 
 .line.meta {
-  color: var(--muted);
-}
-
-.line.context {
-  color: var(--text);
-  opacity: 0.75;
+  opacity: 0.7;
 }
 </style>

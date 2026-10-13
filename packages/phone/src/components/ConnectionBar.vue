@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
-import { gitee } from '@/lib/gitee';
 import { useNow } from '@/lib/now';
+import { isConfigured } from '@/lib/settings';
 import { refreshNow, relay, throttledForMs } from '@/stores/relay';
 
 const now = useNow(1000);
@@ -30,30 +30,36 @@ const phaseLabel = computed(() => {
   }
 });
 
+/**
+ * Two tones, and only two. A recorder is either bringing in the record or it is
+ * not; which of the several ways it is failing belongs in the sentence beside
+ * the mark.
+ */
 const tone = computed(() => {
-  if (isThrottled.value) return 'warn';
-  if (relay.phase === 'error') return 'error';
+  if (isThrottled.value || relay.phase === 'error') return 'fault';
   if (relay.phase === 'ready') return 'ok';
-  return 'muted';
+  return 'neutral';
 });
 
 const detail = computed(() => {
   if (backoffMs.value > 0) return `retry in ${Math.ceil(backoffMs.value / 1000)}s`;
   if (relay.errorKind === 'throttled') return relay.error ?? 'Gitee is throttling requests.';
   if (relay.error) return relay.error;
-  if (!gitee.configured) return 'not configured';
-  if (relay.empty) return 'no relay data yet';
+  // `settings`, not the client: the client's fields are private and invisible to
+  // reactivity, so reading them here caches the first answer forever.
+  if (!isConfigured.value) return 'no relay configured';
+  if (relay.empty) return 'nothing published yet';
   return 'up to date';
 });
 </script>
 
 <template>
   <div class="bar" :class="tone">
-    <span class="dot"></span>
+    <span class="mark" aria-hidden="true"></span>
     <span class="phase">{{ phaseLabel }}</span>
-    <span class="detail">{{ detail }}</span>
+    <span class="detail" :title="detail">{{ detail }}</span>
     <button class="refresh" type="button" :disabled="relay.phase === 'loading'" @click="refreshNow()">
-      ⟳
+      <span aria-hidden="true">⟳</span>
       <span class="sr-only">Refresh now</span>
     </button>
   </div>
@@ -64,41 +70,38 @@ const detail = computed(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
   font-size: 12px;
-  color: var(--muted);
-  position: sticky;
-  top: 0;
-  z-index: 10;
+  color: var(--ink-2);
+  min-width: 0;
 }
 
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--muted);
+/* A square, not a dot: the mark belongs to a machine register. */
+.mark {
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--ink-2);
   flex: none;
 }
 
-.bar.ok .dot {
-  background: var(--accent);
+.bar.ok .mark {
+  background: var(--ink);
+  border-color: var(--ink);
 }
 
-.bar.warn .dot {
-  background: var(--wait);
-}
-
-.bar.error .dot {
-  background: var(--danger);
+.bar.fault .mark {
+  background: var(--fault);
+  border-color: var(--fault);
 }
 
 .phase {
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.bar.fault .phase {
+  color: var(--fault);
 }
 
 .detail {
@@ -109,30 +112,28 @@ const detail = computed(() => {
   white-space: nowrap;
 }
 
+.bar.fault .detail {
+  color: var(--fault);
+}
+
 .refresh {
-  width: var(--tap);
-  height: 32px;
+  width: 40px;
+  height: var(--tap);
+  flex: none;
   border: none;
   background: none;
-  color: var(--muted);
-  font-size: 16px;
+  color: var(--ink-2);
+  font-size: 15px;
+  line-height: 1;
   cursor: pointer;
 }
 
-.bar.warn .detail {
-  color: var(--wait);
+.refresh:hover:not(:disabled) {
+  color: var(--ink);
 }
 
-.bar.error .detail {
-  color: var(--danger);
-}
-
-:deep(.sr-only),
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
+.refresh:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 </style>

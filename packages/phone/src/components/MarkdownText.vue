@@ -88,7 +88,7 @@ const nodes = computed<Inline[] | null>(() => props.inline ?? null);
 /* Space every block apart, whatever kind it is. `:not(:first-child)` rather
    than `* + *` so this outranks the per-block `margin: 0` below. */
 .md > :not(:first-child) {
-  margin-top: 8px;
+  margin-top: 9px;
 }
 
 .para {
@@ -121,20 +121,20 @@ h4.heading,
 h5.heading,
 h6.heading {
   font-size: 1em;
-  color: var(--muted);
+  color: var(--ink-2);
 }
 
 .rule {
   margin: 0;
   border: none;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--rule);
 }
 
 .quote {
   margin: 0;
-  padding: 2px 0 2px 10px;
-  border-left: 3px solid var(--border);
-  color: var(--muted);
+  padding: 1px 0 1px 9px;
+  border-left: 2px solid var(--rule-strong);
+  color: var(--ink-2);
 }
 
 .list {
@@ -148,24 +148,24 @@ h6.heading {
 
 .code {
   margin: 0;
-  background: var(--surface-3);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
   padding: 8px 10px;
-  line-height: 1.45;
+  line-height: 1.5;
   white-space: pre;
   overflow-x: auto;
 }
 
 .inline-code {
-  background: var(--surface-3);
-  border-radius: 4px;
-  padding: 1px 4px;
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0 3px;
   overflow-wrap: anywhere;
 }
 
 .link {
-  color: var(--accent);
   overflow-wrap: anywhere;
 }
 </style>

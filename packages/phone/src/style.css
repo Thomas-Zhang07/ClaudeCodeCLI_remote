@@ -1,43 +1,74 @@
-/* Design tokens. Dark is the default (this is a phone app used at night as often
-   as in daylight); light is honoured through prefers-color-scheme. */
+/* ---------------------------------------------------------------------------
+   Design tokens.
+
+   The subject is a continuous machine log: numbered events, timestamps, turns,
+   counters, arriving one after another. That is a chart recorder, not a
+   dashboard — so the surface is paper, the marks are ink, and the numbers sit
+   in a ruled channel.
+
+   Six named values, and nothing else carries a hue:
+
+     paper  the stock           cool green-grey, an engineering pad
+     plate  a raised face       the instrument panel, notices, fields
+     rule   every hairline      the strip's channel, panel edges, table rules
+     ink    text and the trace
+     ink-2  the trace, faint    secondary text
+     signal A PERSON IS NEEDED  waiting, attention. Reserved; never decoration
+     fault  THE RECORD IS TORN  stream gap, failure
+
+   Color covers roughly two percent of pixels on purpose. Where a state matters
+   it is also a word and a shape, never only a hue.
+
+   Light is paper with dark ink. Dark is the same paper with the lamp turned
+   down — a green-grey ground, not black, so the ink still reads as ink.
+   --------------------------------------------------------------------------- */
 
 :root {
-  --bg: #0f1115;
-  --surface: #171a21;
-  --surface-2: #1f232c;
-  --surface-3: #262b36;
-  --border: #2b313d;
-  --text: #e7e9ee;
-  --muted: #98a1b0;
-  --accent: #7dd3a7;
-  --accent-ink: #0c1116;
-  --info: #7fb4f2;
-  --wait: #f2bd5c;
-  --danger: #f2797c;
-  --add: #7dd3a7;
-  --del: #f2797c;
-  --radius: 12px;
-  --radius-sm: 8px;
+  --paper: #171a18;
+  --plate: #212520;
+  --rule: #333a33;
+  /* One step heavier: the rule that opens the strip, and the foot of a ledger. */
+  --rule-strong: #4b5449;
+  --ink: #dfe3d7;
+  --ink-2: #9aa394;
+  --signal: #e0a33c;
+  --fault: #ee7266;
+  /* Content ink, used inside an expanded diff and nowhere else. */
+  --add-ink: #8fb07e;
+
+  --gutter: 42px;
   --tap: 44px;
+  /* The page gutter. The strip bleeds by exactly this much, so the two must
+     come from one place. */
+  --page-pad: 12px;
+  /* A sans `ch` is the width of `0`, which is wider than the average letter,
+     so 58ch lands a rendered line around 60 characters: comfortably under 80,
+     and short enough to read without moving your eyes on a phone. */
+  --measure: 58ch;
+  --radius: 3px;
+
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f7f9;
-    --surface: #ffffff;
-    --surface-2: #f1f3f7;
-    --surface-3: #e7eaf0;
-    --border: #d8dde6;
-    --text: #16181d;
-    --muted: #5d6675;
-    --accent: #1f9d68;
-    --accent-ink: #ffffff;
-    --info: #1f6fd0;
-    --wait: #a86a12;
-    --danger: #c0393c;
-    --add: #1f9d68;
-    --del: #c0393c;
+    --paper: #e6e8e0;
+    --plate: #f1f2ec;
+    --rule: #c6cabe;
+    --rule-strong: #9aa192;
+    --ink: #1d231e;
+    --ink-2: #59604f;
+    --signal: #8f5a00;
+    --fault: #9e241c;
+    --add-ink: #3d6b39;
+  }
+}
+
+@media (min-width: 480px) {
+  :root {
+    --page-pad: 16px;
   }
 }
 
@@ -49,17 +80,16 @@ html,
 body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
-  color: var(--text);
+  background: var(--paper);
+  color: var(--ink);
   /* A phone width is the design target; nothing may push the page sideways. */
   overflow-x: hidden;
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
-    "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--sans);
   font-size: 15px;
-  line-height: 1.5;
+  line-height: 1.55;
   -webkit-text-size-adjust: 100%;
   -webkit-font-smoothing: antialiased;
 }
@@ -81,35 +111,50 @@ select {
   font-family: inherit;
 }
 
-textarea,
-input {
-  background: var(--surface-2);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px;
+input,
+textarea {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 11px 12px;
   width: 100%;
   font-size: 16px; /* below 16px iOS zooms the viewport on focus */
 }
 
 textarea {
   resize: vertical;
-  min-height: 88px;
+  min-height: 96px;
+  line-height: 1.5;
 }
 
-input:focus,
-textarea:focus {
-  outline: 2px solid var(--accent);
-  outline-offset: -1px;
+input:focus-visible,
+textarea:focus-visible,
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--ink);
+  color: var(--paper);
 }
 
 a {
-  color: var(--accent);
+  /* An ink underline, not a hue: the accent is spoken for. */
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
 pre,
-code {
+code,
+.mono {
   font-family: var(--mono);
+  font-variant-numeric: tabular-nums slashed-zero;
   font-size: 13px;
 }
 
@@ -119,17 +164,18 @@ pre {
   -webkit-overflow-scrolling: touch;
 }
 
-/* Utilities shared by several views. */
+/* --- shared primitives ---------------------------------------------------- */
 
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
+/* A raised face. No shadow, no rounded corner: the edge is a hairline. */
+.plate {
+  background: var(--plate);
+  border: 1px solid var(--rule);
   border-radius: var(--radius);
   padding: 12px;
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--ink-2);
 }
 
 .row {
@@ -146,30 +192,71 @@ pre {
   min-height: var(--tap);
 }
 
+/* Small engraved text: a unit, a field name, a state word. Never above a
+   heading, and never in capitals — the letterforms are enough. */
+.engraved {
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  color: var(--ink-2);
+}
+
+.big-num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums slashed-zero;
+  letter-spacing: -0.01em;
+}
+
 .btn {
   min-height: var(--tap);
   padding: 10px 16px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--surface-2);
+  border-radius: var(--radius);
+  border: 1px solid var(--rule-strong);
+  background: var(--plate);
   cursor: pointer;
 }
 
-.btn:active {
-  background: var(--surface-3);
+.btn:hover {
+  border-color: var(--ink-2);
 }
 
+.btn:active {
+  background: var(--paper);
+}
+
+/* The primary action is the reader's own voice, so it is a solid ink block.
+   The accent stays reserved for the machine asking for a person. */
 .btn-primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-ink);
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
   font-weight: 600;
+}
+
+.btn-primary:active {
+  background: var(--ink-2);
+  border-color: var(--ink-2);
 }
 
 .btn-primary:disabled,
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
+}
+
+/* A bare control that is still a 44px target. */
+.ghost {
+  min-height: var(--tap);
+  padding: 0 10px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--ink-2);
+}
+
+.ghost:hover {
+  color: var(--ink);
 }
 
 .sr-only {
@@ -179,4 +266,14 @@ pre {
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

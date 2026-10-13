@@ -11,7 +11,6 @@ const props = defineProps<{ node: SubagentNode; depth: number }>();
 const open = ref(props.depth === 0);
 
 const children = computed<SubagentNode[]>(() => (Array.isArray(props.node.children) ? props.node.children : []));
-const statusClass = computed(() => props.node.status);
 </script>
 
 <template>
@@ -20,23 +19,23 @@ const statusClass = computed(() => props.node.status);
       class="row"
       type="button"
       :disabled="children.length === 0"
-      :aria-expanded="open"
+      :aria-expanded="children.length > 0 ? open : undefined"
+      :class="node.status"
       @click="open = !open"
     >
-      <span v-if="children.length > 0" class="chevron" :class="{ open }">›</span>
-      <span v-else class="dot">•</span>
+      <span v-if="children.length > 0" class="caret" :class="{ open }" aria-hidden="true">›</span>
+      <span v-else class="bulb" aria-hidden="true"></span>
 
       <span class="body">
         <span class="line1">
           <span class="type">{{ node.agentType || 'agent' }}</span>
-          <span class="status" :class="statusClass">{{ node.status }}</span>
-          <span v-if="node.model" class="model">{{ node.model }}</span>
-          <span class="duration">{{ formatDurationMs(node.durationMs) }}</span>
+          <span class="status">{{ node.status }}</span>
+          <span v-if="node.model" class="extra">{{ node.model.replace(/^claude-/, '') }}</span>
+          <span class="extra">{{ formatDurationMs(node.durationMs) }}</span>
+          <span v-if="children.length > 0" class="extra">{{ children.length }} spawned</span>
         </span>
         <span class="desc">{{ node.description || node.agentId }}</span>
       </span>
-
-      <span v-if="children.length > 0" class="count">{{ children.length }}</span>
     </button>
 
     <ul v-if="open && children.length > 0" class="children">
@@ -61,96 +60,109 @@ const statusClass = computed(() => props.node.status);
   gap: 6px;
   width: 100%;
   min-height: var(--tap);
-  padding: 6px 8px;
-  background: none;
+  padding: 5px 0 5px 4px;
   border: none;
+  border-left: 2px solid var(--rule);
+  background: none;
   text-align: left;
   cursor: pointer;
 }
 
 .row:disabled {
   cursor: default;
-  opacity: 1;
 }
 
-.row:active:not(:disabled) {
-  background: var(--surface-2);
+.row:not(:disabled):hover {
+  border-left-color: var(--ink-2);
 }
 
-.chevron {
-  color: var(--muted);
-  font-size: 18px;
-  line-height: 22px;
+/* Running is the one state a reader is waiting on, so it gets the ink. */
+.row.running {
+  border-left-color: var(--ink);
+}
+
+.row.failed {
+  border-left-color: var(--fault);
+}
+
+.caret {
+  align-self: center;
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--ink-2);
   transition: transform 0.15s ease;
 }
 
-.chevron.open {
+.caret.open {
   transform: rotate(90deg);
 }
 
-.dot {
-  color: var(--border);
-  line-height: 22px;
+.bulb {
+  align-self: center;
+  flex: none;
+  width: 5px;
+  height: 5px;
+  margin: 0 5px;
+  border: 1px solid var(--rule-strong);
 }
 
 .body {
-  min-width: 0;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  padding-left: 6px;
+  gap: 1px;
+  flex: 1;
 }
 
 .line1 {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  align-items: baseline;
+  gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .type {
   font-family: var(--mono);
   font-size: 12px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 .status {
-  font-size: 11px;
-  border-radius: 999px;
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
 }
 
-.status.running {
-  color: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+.row.running .status {
+  color: var(--ink);
 }
 
-.status.failed {
-  color: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+.row.failed .status {
+  color: var(--fault);
 }
 
-.model,
-.duration {
-  font-size: 11px;
-  color: var(--muted);
+.extra {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ink-2);
+  white-space: nowrap;
 }
 
 .desc {
   font-size: 13px;
-  color: var(--text);
+  line-height: 1.5;
+  color: var(--ink-2);
   overflow-wrap: anywhere;
 }
 
-.count {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--muted);
-}
-
+/* The fork is drawn, not boxed: one hairline per level, nothing else. */
 .children {
-  margin: 0;
-  padding: 0 0 0 14px;
-  border-left: 1px solid var(--border);
-  margin-left: 14px;
+  margin: 0 0 0 12px;
+  padding: 0;
+  border-left: 1px solid var(--rule);
 }
 </style>
