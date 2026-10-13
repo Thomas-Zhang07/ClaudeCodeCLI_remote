@@ -23,6 +23,14 @@ export interface RelayIndex {
   version: number;
   generatedAt: string;
   sessions: SessionIndexEntry[];
+  /**
+   * Whether the PC will deliver prompts at all.
+   *
+   * Distinct from a session's `controllable`: the PC can own a session's
+   * terminal while still refusing prompts. Absent on an older index, and
+   * deliberately not defaulted to true — an unknown policy is not permission.
+   */
+  injectionEnabled?: boolean;
 }
 
 export interface CostState {
