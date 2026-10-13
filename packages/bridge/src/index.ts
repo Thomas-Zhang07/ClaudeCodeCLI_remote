@@ -344,6 +344,11 @@ export class Bridge {
       hasSession: Boolean(runtime && entry),
       controllable: Boolean(registration),
       lastMainKind: runtime?.lastMainKind ?? null,
+      // Sequence 0 means this bridge has never recorded a single event for the
+      // session, which is what a just-started one looks like. A session that
+      // existed before the bridge began is not fresh: it was cold-started and
+      // replayed, or restored from persisted state, so its sequence is past 0.
+      isFresh: runtime?.aggregator.seq === 0,
     });
     if (refusal) {
       // Spell out the mid-turn case. It is the one a person will actually hit,

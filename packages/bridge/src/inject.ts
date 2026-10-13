@@ -41,6 +41,16 @@ export interface InjectionContext {
   controllable: boolean;
   /** Kind of the most recent main-thread event, or null if there is none. */
   lastMainKind: string | null;
+  /**
+   * The session has recorded nothing at all — it has just been started.
+   *
+   * Distinct from "we do not know", and the distinction matters: a brand new
+   * session is provably safe to type into, because nothing has run yet so no
+   * dialog can be open. Without this the guard would refuse every prompt to a
+   * freshly started session, meaning a conversation could only ever be
+   * continued from the phone, never begun.
+   */
+  isFresh: boolean;
 }
 
 /**
@@ -65,8 +75,17 @@ export function injectionRefusal(context: InjectionContext): InjectionRefusal | 
   if (!context.injectionEnabled) return 'injection-disabled';
   if (!context.hasSession) return 'unknown-session';
   if (!context.controllable) return 'not-controllable';
-  if (context.lastMainKind !== 'turn_end') return 'session-not-idle';
-  return null;
+
+  // A completed turn proves the session is idle at a clean prompt — and, since
+  // a dialog only exists mid-turn, that none is open.
+  //
+  // A session that has recorded nothing at all is safe for the same reason by a
+  // different route: nothing has run, so there is nothing to be blocked on.
+  // This is what lets the phone start a conversation rather than only join one.
+  if (context.lastMainKind === 'turn_end') return null;
+  if (context.isFresh) return null;
+
+  return 'session-not-idle';
 }
 
 export interface InjectOptions {

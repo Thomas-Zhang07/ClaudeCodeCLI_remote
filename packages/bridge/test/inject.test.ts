@@ -27,10 +27,33 @@ describe('injectionRefusal', () => {
     hasSession: true,
     controllable: true,
     lastMainKind: 'turn_end',
+    isFresh: false,
   };
 
   it('allows a prompt when the session is idle after a completed turn', () => {
     expect(injectionRefusal(ready)).toBeNull();
+  });
+
+  describe('a freshly started session', () => {
+    // Otherwise a conversation could only be continued from the phone, never
+    // begun: the phone's first prompt is exactly the case with no prior turn.
+    it('allows the first prompt, because nothing has run so no dialog can be open', () => {
+      expect(injectionRefusal({ ...ready, lastMainKind: null, isFresh: true })).toBeNull();
+    });
+
+    it('still refuses once the session has done anything', () => {
+      expect(injectionRefusal({ ...ready, lastMainKind: 'user_prompt', isFresh: false })).toBe(
+        'session-not-idle',
+      );
+    });
+
+    it('does not treat "we do not know" as fresh', () => {
+      // A session that existed before this bridge started, with no event read
+      // yet, is not fresh — it might be mid-turn.
+      expect(injectionRefusal({ ...ready, lastMainKind: null, isFresh: false })).toBe(
+        'session-not-idle',
+      );
+    });
   });
 
   it('refuses while the operator has injection switched off', () => {
