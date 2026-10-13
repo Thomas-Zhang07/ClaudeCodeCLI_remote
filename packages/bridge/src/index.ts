@@ -25,6 +25,7 @@ import {
 
 import { ChunkWriter, atomicWriteJson } from './chunker.js';
 import { type BridgeConfig, loadConfig, loadEnvFile } from './config.js';
+import { readControlled } from './control.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
 import { RelaySync } from './sync.js';
 import {
@@ -79,6 +80,8 @@ export class Bridge {
   #relay: RelaySync | null = null;
   #relayDirty = false;
   #seenPrompts = new Set<string>();
+  /** Pids of sessions launched through `ccr`, refreshed with the registry. */
+  #controlledPids = new Set<number>();
 
   constructor(config: BridgeConfig) {
     this.#config = config;
@@ -336,11 +339,15 @@ export class Bridge {
     const entries = await readRegistry(this.#config.sessionsDir);
     this.#registry = new Map(entries.map((e) => [e.sessionId, e]));
 
+    // Sessions launched through `ccr` register themselves; matching on pid is
+    // what separates a session we can type into from one we can only watch.
+    const controlled = await readControlled(this.#config.stateDir);
+    this.#controlledPids = new Set(controlled.map((c) => c.pid));
+
     for (const runtime of this.#sessions.values()) {
       const entry = this.#registry.get(runtime.sessionId) ?? null;
-      // A session is controllable only when we own its stdin, which for now is
-      // never — the ccr wrapper has not been built yet.
-      if (runtime.aggregator.applyRegistry(entry, false)) runtime.stateDirty = true;
+      const controllable = entry !== null && this.#controlledPids.has(entry.pid);
+      if (runtime.aggregator.applyRegistry(entry, controllable)) runtime.stateDirty = true;
     }
   }
 
@@ -458,6 +465,7 @@ export class Bridge {
       version: 1,
       generatedAt: new Date().toISOString(),
       sessions,
+      injectionEnabled: this.#config.allowInjection,
     };
     await atomicWriteJson(join(this.#config.outDir, 'index.json'), index);
   }

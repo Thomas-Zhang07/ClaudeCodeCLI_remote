@@ -155,8 +155,10 @@ npm run build
 # monitor only — tails every session, read-only
 npm run bridge
 
-# or launch a controllable session (full TUI, prompts injectable)
-npm run ccr -- --cwd /path/to/project
+# or launch a controllable session in the current directory.
+# Every argument after `ccr` is passed straight through to Claude Code, so
+# anything you would normally type works here unchanged.
+npm run ccr
 
 # phone UI
 npm run phone:dev      # local dev server
@@ -199,7 +201,7 @@ Mitigations in place:
 - [ ] **M2** Bridge — local tailing, normalization, chunk writing
 - [ ] **M3** Gitee sync — push, poll, rate-limit backoff, inbound reader
 - [x] **M4** Phone PWA — session list, chat, diffs, subagent tree
-- [ ] **M5** `ccr` — ConPTY passthrough wrapper
+- [x] **M5** `ccr` — ConPTY passthrough wrapper
 - [ ] **M6** Prompt injection with the permission-dialog guard
 - [ ] **M7** Optional hooks for lower-latency attention state
 - [ ] **M8** Retention, compaction, quota display

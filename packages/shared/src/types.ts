@@ -252,6 +252,15 @@ export interface RelayIndex {
   version: number;
   generatedAt: string;
   sessions: SessionIndexEntry[];
+  /**
+   * Whether the bridge will actually deliver prompts.
+   *
+   * Separate from a session's `controllable`: a session can be launchable from
+   * the phone and still refuse prompts, because injection is a policy the
+   * operator sets. Publishing it lets the phone explain a refusal instead of
+   * leaving prompts sitting unacknowledged with no visible reason.
+   */
+  injectionEnabled?: boolean;
 }
 
 export interface ChunkEntry {
