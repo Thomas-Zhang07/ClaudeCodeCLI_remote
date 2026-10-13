@@ -3,9 +3,9 @@
  * inbound path is exercised without touching the network.
  *
  * The most important test here is that a publish never removes an inbound
- * prompt. That failure mode is silent — a force-push or a careless `git add -A`
- * would delete a prompt the phone had written but the bridge had not fetched,
- * and nothing would report it.
+ * prompt. That failure mode is silent — and it is why outbound and inbound live
+ * on separate branches: outbound is amended and force-pushed, which would take
+ * an un-fetched prompt with it if the two shared a branch.
  */
 
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
@@ -17,33 +17,38 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { git, gitOrThrow } from '../src/git.js';
 import { RelaySync } from '../src/sync.js';
 
+const OUT = 'relay-out';
+const IN = 'relay-in';
+
 let root: string;
 let remote: string;
-let bridgeClone: string;
+let outClone: string;
+let inClone: string;
 let phoneClone: string;
 let outDir: string;
 
-const BRANCH = 'relay';
-
-/** Create a bare remote with an initial commit on the relay branch. */
+/** Create a bare remote holding both branches. */
 async function seedRemote(): Promise<void> {
-  await gitOrThrow(['init', '--bare', '--initial-branch', BRANCH, remote], { cwd: root });
+  await gitOrThrow(['init', '--bare', remote], { cwd: root });
 
   const seed = join(root, 'seed');
   await mkdir(seed, { recursive: true });
-  await gitOrThrow(['init', '--initial-branch', BRANCH], { cwd: seed });
+  await gitOrThrow(['init', '--initial-branch', OUT], { cwd: seed });
   await gitOrThrow(['config', 'user.email', 'seed@example.com'], { cwd: seed });
   await gitOrThrow(['config', 'user.name', 'seed'], { cwd: seed });
   await writeFile(join(seed, 'README.md'), '# relay\n');
   await gitOrThrow(['add', '-A'], { cwd: seed });
   await gitOrThrow(['commit', '-m', 'seed'], { cwd: seed });
   await gitOrThrow(['remote', 'add', 'origin', remote], { cwd: seed });
-  await gitOrThrow(['push', 'origin', BRANCH], { cwd: seed });
+
+  await gitOrThrow(['push', 'origin', `${OUT}:${OUT}`], { cwd: seed });
+  // The inbound branch must exist before the phone can clone it.
+  await gitOrThrow(['push', 'origin', `${OUT}:${IN}`], { cwd: seed });
 }
 
-/** A second working copy standing in for the phone. */
+/** A second working copy standing in for the phone, on the inbound branch. */
 async function cloneForPhone(): Promise<void> {
-  await gitOrThrow(['clone', '--branch', BRANCH, remote, phoneClone], { cwd: root });
+  await gitOrThrow(['clone', '--branch', IN, remote, phoneClone], { cwd: root });
   await gitOrThrow(['config', 'user.email', 'phone@example.com'], { cwd: phoneClone });
   await gitOrThrow(['config', 'user.name', 'phone'], { cwd: phoneClone });
 }
@@ -57,25 +62,32 @@ async function cloneForPhone(): Promise<void> {
  * has published in the meantime, which is a flaw in the test, not the code.
  */
 async function phoneWritesPrompt(sessionId: string, name: string, body: unknown): Promise<void> {
-  await gitOrThrow(['fetch', 'origin', BRANCH], { cwd: phoneClone });
-  await gitOrThrow(['reset', '--hard', `origin/${BRANCH}`], { cwd: phoneClone });
+  await gitOrThrow(['fetch', 'origin', IN], { cwd: phoneClone });
+  await gitOrThrow(['reset', '--hard', `origin/${IN}`], { cwd: phoneClone });
 
   const dir = join(phoneClone, 'in', sessionId);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, name), JSON.stringify(body));
   await gitOrThrow(['add', '-A'], { cwd: phoneClone });
   await gitOrThrow(['commit', '-m', `prompt ${name}`], { cwd: phoneClone });
-  await gitOrThrow(['push', 'origin', BRANCH], { cwd: phoneClone });
+  await gitOrThrow(['push', 'origin', IN], { cwd: phoneClone });
+}
+
+function relayOptions(over: Partial<ConstructorParameters<typeof RelaySync>[0]> = {}) {
+  return {
+    repoUrl: remote,
+    token: null,
+    outBranch: OUT,
+    inBranch: IN,
+    outCloneDir: outClone,
+    inCloneDir: inClone,
+    outDir,
+    ...over,
+  };
 }
 
 async function makeSync(): Promise<RelaySync> {
-  const sync = new RelaySync({
-    repoUrl: remote,
-    token: null,
-    branch: BRANCH,
-    cloneDir: bridgeClone,
-    outDir,
-  });
+  const sync = new RelaySync(relayOptions());
   await sync.init();
   return sync;
 }
@@ -86,10 +98,18 @@ async function writeChunk(sessionId: string, content: string): Promise<void> {
   await writeFile(join(dir, 'events-0001.jsonl'), content);
 }
 
+/** Pull the inbound branch into the phone clone and read a path from it. */
+async function readFromRemote(path: string): Promise<string | null> {
+  await gitOrThrow(['fetch', 'origin', IN], { cwd: phoneClone });
+  const result = await git(['show', `origin/${IN}:${path}`], { cwd: phoneClone });
+  return result.code === 0 ? result.stdout : null;
+}
+
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), 'ccr-sync-'));
   remote = join(root, 'remote.git');
-  bridgeClone = join(root, 'bridge');
+  outClone = join(root, 'out-clone');
+  inClone = join(root, 'in-clone');
   phoneClone = join(root, 'phone');
   outDir = join(root, 'out');
 
@@ -98,26 +118,53 @@ beforeEach(async () => {
 });
 
 describe('RelaySync', () => {
-  it('publishes local chunks to the remote', async () => {
+  it('publishes local chunks to the outbound branch', async () => {
     await writeChunk('sess-1', '{"seq":1,"kind":"assistant_text"}\n');
     const sync = await makeSync();
 
     expect(await sync.publish('relay: update')).toBe('pushed');
 
-    // Visible from another clone, i.e. the phone would see it.
-    await gitOrThrow(['pull', 'origin', BRANCH], { cwd: phoneClone });
-    const text = await readFile(
-      join(phoneClone, 'out', 'sessions', 'sess-1', 'events-0001.jsonl'),
-      'utf8',
-    );
-    expect(text).toContain('"seq":1');
+    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${OUT}`], { cwd: remote });
+    expect(tree.stdout).toContain('out/sessions/sess-1/events-0001.jsonl');
+  });
+
+  it('keeps outbound history at a single commit', async () => {
+    // The whole point of the branch split: publishing every few seconds must not
+    // add a commit every few seconds.
+    const sync = await makeSync();
+
+    for (let i = 1; i <= 5; i++) {
+      await writeChunk(`sess-${i}`, `{"seq":${i}}\n`);
+      expect(await sync.publish(`publish ${i}`)).toBe('pushed');
+    }
+
+    const log = await git(['rev-list', '--count', `refs/heads/${OUT}`], { cwd: remote });
+    // Exactly one commit, no matter how many publishes. The first amend rewrites
+    // whatever was at the branch tip — the seed here, nothing on a fresh relay —
+    // and every later publish rewrites that same commit again.
+    expect(Number.parseInt(log.stdout.trim(), 10)).toBe(1);
+
+    // And every chunk is still present — amending rewrites the commit, never the
+    // files, so a reader's cached blob SHAs stay valid.
+    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${OUT}`], { cwd: remote });
+    for (let i = 1; i <= 5; i++) {
+      expect(tree.stdout).toContain(`out/sessions/sess-${i}/events-0001.jsonl`);
+    }
+  });
+
+  it('reports nothing to do when the outbound branch already matches', async () => {
+    await writeChunk('sess-1', '{"seq":1}\n');
+    const sync = await makeSync();
+
+    expect(await sync.publish('first')).toBe('pushed');
+    expect(await sync.publish('second')).toBe('clean');
   });
 
   it('uses its own repository even when the clone sits inside another one', async () => {
     // Regression: the clone defaulted to a directory inside the project's own
     // repository. `git rev-parse --git-dir` walked up, found the enclosing .git,
     // reported success, and the bridge then staged into the *project* repo
-    // instead of the relay — failing on an ignored path and pushing nothing.
+    // instead of the relay.
     const outer = join(root, 'outer');
     await mkdir(outer, { recursive: true });
     await gitOrThrow(['init', '--initial-branch', 'main'], { cwd: outer });
@@ -127,89 +174,43 @@ describe('RelaySync', () => {
     await gitOrThrow(['add', '-A'], { cwd: outer });
     await gitOrThrow(['commit', '-m', 'outer'], { cwd: outer });
 
-    const nested = join(outer, 'nested', 'repo');
     await writeChunk('sess-1', '{"seq":1}\n');
-
-    const sync = new RelaySync({
-      repoUrl: remote,
-      token: null,
-      branch: BRANCH,
-      cloneDir: nested,
-      outDir,
-    });
+    const sync = new RelaySync(
+      relayOptions({
+        outCloneDir: join(outer, 'nested', 'out'),
+        inCloneDir: join(outer, 'nested', 'in'),
+      }),
+    );
     await sync.init();
     expect(await sync.publish('relay: nested')).toBe('pushed');
 
-    // The enclosing repository must be completely untouched — no staged files,
-    // no commits, nothing added to its index.
+    // The enclosing repository must be completely untouched.
     const status = await git(['status', '--porcelain'], { cwd: outer });
     expect(status.stdout.trim()).toBe('');
 
-    // And the relay received the data — the commit went to the clone, not to
-    // the enclosing repository.
-    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${BRANCH}`], {
-      cwd: remote,
-    });
+    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${OUT}`], { cwd: remote });
     expect(tree.stdout).toContain('out/sessions/sess-1/events-0001.jsonl');
-
-    await gitOrThrow(['pull', 'origin', BRANCH], { cwd: phoneClone });
-    expect(existsSync(join(phoneClone, 'out', 'sessions', 'sess-1', 'events-0001.jsonl'))).toBe(
-      true,
-    );
   });
 
   it('rewrites a stale remote rather than fetching from the wrong repository', async () => {
-    // Retries with backoff make this slower than the default allowance.
-    // Regression: an existing clone was trusted as long as *some* remote was
-    // configured. Re-pointing CCR_REPO_URL then left the clone fetching from
-    // the old repository while pushing to the new one — which appears to work
-    // and fails confusingly later.
     const first = await makeSync();
     await writeChunk('sess-1', '{"seq":1}\n');
     expect(await first.publish('first')).toBe('pushed');
 
-    // A second, independent relay.
     const other = join(root, 'other.git');
-    await gitOrThrow(['init', '--bare', '--initial-branch', BRANCH, other], { cwd: root });
+    await gitOrThrow(['init', '--bare', other], { cwd: root });
 
-    const second = new RelaySync({
-      repoUrl: other,
-      token: null,
-      branch: BRANCH,
-      cloneDir: bridgeClone,
-      outDir,
-    });
+    const second = new RelaySync(relayOptions({ repoUrl: other }));
     await second.init();
 
-    const url = await git(['remote', 'get-url', 'origin'], { cwd: bridgeClone });
+    const url = await git(['remote', 'get-url', 'origin'], { cwd: outClone });
     expect(url.stdout.trim()).toBe(other);
 
     await writeChunk('sess-2', '{"seq":1}\n');
-    expect(existsSync(join(outDir, 'sessions', 'sess-2', 'events-0001.jsonl'))).toBe(true);
-
-    // Also guards the fixed bug: a failed push must never be reported as
-    // 'clean', which would tell the caller there is nothing left to send.
     expect(await second.publish('second')).toBe('pushed');
 
-    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${BRANCH}`], { cwd: other });
+    const tree = await git(['ls-tree', '-r', '--name-only', `refs/heads/${OUT}`], { cwd: other });
     expect(tree.stdout).toContain('out/sessions/sess-2/events-0001.jsonl');
-  });
-
-  it('reports nothing to do when the tree is unchanged', async () => {
-    await writeChunk('sess-1', '{"seq":1}\n');
-    const sync = await makeSync();
-
-    expect(await sync.publish('first')).toBe('pushed');
-    expect(await sync.publish('second')).toBe('clean');
-  });
-
-  it('picks up later changes', async () => {
-    await writeChunk('sess-1', '{"seq":1}\n');
-    const sync = await makeSync();
-    await sync.publish('first');
-
-    await writeChunk('sess-2', '{"seq":1}\n');
-    expect(await sync.publish('second')).toBe('pushed');
   });
 
   describe('the inbound safety property', () => {
@@ -221,37 +222,58 @@ describe('RelaySync', () => {
       const sync = await makeSync();
       await sync.publish('relay: update');
 
-      // It must still be there, locally and on the remote.
-      expect(existsSync(join(bridgeClone, 'in', 'sess-1', '1700000000-aaa.json'))).toBe(true);
-
-      await gitOrThrow(['pull', 'origin', BRANCH], { cwd: phoneClone });
-      const survived = await readFile(
-        join(phoneClone, 'in', 'sess-1', '1700000000-aaa.json'),
-        'utf8',
-      );
-      expect(JSON.parse(survived).text).toBe('hello');
+      expect(existsSync(join(inClone, 'in', 'sess-1', '1700000000-aaa.json'))).toBe(true);
+      expect(await readFromRemote('in/sess-1/1700000000-aaa.json')).toContain('hello');
     });
 
     it('survives a publish that races the phone writing a prompt', async () => {
       const sync = await makeSync();
-
       await writeChunk('sess-1', '{"seq":1}\n');
       await sync.publish('first');
 
-      // Phone commits while the bridge is mid-publish.
       await phoneWritesPrompt('sess-1', '1700000001-bbb.json', { version: 1, text: 'second' });
       await writeChunk('sess-1', '{"seq":2}\n');
 
-      // The push is rejected the first time; the retry must merge, not clobber.
       expect(await sync.publish('second')).toBe('pushed');
 
-      await gitOrThrow(['pull', 'origin', BRANCH], { cwd: phoneClone });
-      expect(existsSync(join(phoneClone, 'in', 'sess-1', '1700000001-bbb.json'))).toBe(true);
-      const chunk = await readFile(
-        join(phoneClone, 'out', 'sessions', 'sess-1', 'events-0001.jsonl'),
-        'utf8',
-      );
-      expect(chunk).toContain('"seq":2');
+      // The force-push on the outbound branch must not have touched inbound.
+      expect(await readFromRemote('in/sess-1/1700000001-bbb.json')).toContain('second');
+    });
+
+    it('survives repeated outbound force-pushes', async () => {
+      await phoneWritesPrompt('sess-1', '1700000002-ccc.json', { version: 1, text: 'keep me' });
+      const sync = await makeSync();
+
+      for (let i = 1; i <= 4; i++) {
+        await writeChunk('sess-1', `{"seq":${i}}\n`);
+        await sync.publish(`publish ${i}`);
+      }
+
+      expect(await readFromRemote('in/sess-1/1700000002-ccc.json')).toContain('keep me');
+    });
+  });
+
+  describe('opening the inbound channel', () => {
+    it('creates the inbound branch when the relay does not have one', async () => {
+      // The phone writes through an API that needs a branch to exist, and an
+      // empty repository has none. Bootstrapping here means the phone never has
+      // to handle a first-run case.
+      await gitOrThrow(['push', 'origin', '--delete', IN], { cwd: phoneClone });
+
+      const gone = await git(['ls-remote', '--heads', remote, IN], { cwd: root });
+      expect(gone.stdout.trim()).toBe('');
+
+      await makeSync();
+
+      const back = await git(['ls-remote', '--heads', remote, IN], { cwd: root });
+      expect(back.stdout).toContain(IN);
+    });
+
+    it('leaves an existing inbound branch alone', async () => {
+      const before = await git(['rev-parse', `refs/heads/${IN}`], { cwd: remote });
+      await makeSync();
+      const after = await git(['rev-parse', `refs/heads/${IN}`], { cwd: remote });
+      expect(after.stdout.trim()).toBe(before.stdout.trim());
     });
   });
 
@@ -261,9 +283,7 @@ describe('RelaySync', () => {
       await phoneWritesPrompt('sess-2', '1700000001-bbb.json', { version: 1, text: 'two' });
 
       const sync = await makeSync();
-      const found = await sync.listInbound();
-
-      expect(found.sort()).toEqual([
+      expect((await sync.listInbound()).sort()).toEqual([
         join('sess-1', '1700000000-aaa.json'),
         join('sess-2', '1700000001-bbb.json'),
       ]);
@@ -275,7 +295,6 @@ describe('RelaySync', () => {
       const sync = await makeSync();
       const [first] = await sync.listInbound();
       const body = await sync.readInbound(first!);
-
       expect((body as { text: string }).text).toBe('hello');
     });
 
@@ -300,7 +319,8 @@ describe('RelaySync', () => {
 
       expect(await sync.listInbound()).toEqual([]);
       // Moved aside, not deleted — it is the record of what was run.
-      expect(existsSync(join(bridgeClone, 'in', '.done'))).toBe(true);
+      expect(existsSync(join(inClone, 'in', '.done'))).toBe(true);
+      expect(await readFromRemote('in/.done/sess-1__1700000000-aaa.json')).toContain('hello');
     });
   });
 });

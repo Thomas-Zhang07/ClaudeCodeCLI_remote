@@ -61,17 +61,22 @@ cannot deliver would lose it silently.
 **Consequence:** `in/` accumulates. A `seenPrompts` set prevents re-reporting,
 so this is untidy rather than harmful — until M6 lands.
 
-### 5. One commit per publish, with no compaction
+### 5. ~~One commit per publish, with no compaction~~ — RESOLVED
 
-Every publish that changes the tree creates a commit. At a 10s cadence with
-frequent `index.json`/`state.json` updates, that is thousands of commits a day.
+Every publish created a commit: thousands a day at a 10s cadence.
 
-The plan's answer was periodic squashing, but squashing means rewriting the
-branch, which would destroy an un-fetched inbound prompt. `out/` and `in/`
-therefore need **separate branches** — `out/` can be rewritten freely, `in/` must
-stay append-only.
+Periodic squashing was the obvious answer, but squashing rewrites the branch,
+which would destroy an un-fetched inbound prompt. The two concerns are in
+genuine conflict on a single branch.
 
-**Status:** not implemented (M8).
+**Resolved** by splitting them: `relay-out` (the bridge amends a single commit
+and force-pushes — history stays at exactly one commit forever) and `relay-in`
+(append-only, fast-forward only). Chunk files are still never modified or
+renumbered, so a reader's cached blob SHAs stay valid across a force-push; only
+the commit that carries them is rewritten.
+
+The branches also get separate clones, so a force-push on one cannot disturb the
+working tree holding un-consumed prompts on the other.
 
 ### 6. `relayDirty` only tracks chunk appends
 

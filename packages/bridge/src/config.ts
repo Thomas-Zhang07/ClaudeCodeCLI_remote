@@ -21,7 +21,16 @@ export interface BridgeConfig {
 
   repoUrl: string | null;
   repoToken: string | null;
-  branch: string;
+  /**
+   * Branch the bridge publishes to.
+   *
+   * Separate from the inbound branch because publishing amends a single commit
+   * and force-pushes — which would destroy an un-fetched prompt if the two
+   * shared a branch. Outbound history is disposable; inbound history is not.
+   */
+  outBranch: string;
+  /** Append-only branch the phone writes prompts to. Never rewritten. */
+  inBranch: string;
   secret: string | null;
 
   pushIntervalMs: number;
@@ -78,7 +87,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
 
     repoUrl: env['CCR_REPO_URL'] ?? null,
     repoToken: env['CCR_REPO_TOKEN'] ?? null,
-    branch: env['CCR_BRANCH'] ?? 'relay',
+    outBranch: env['CCR_OUT_BRANCH'] ?? 'relay-out',
+    inBranch: env['CCR_IN_BRANCH'] ?? 'relay-in',
     secret: env['CCR_SECRET'] ?? null,
 
     pushIntervalMs: num(env['CCR_PUSH_MS'], 10_000),

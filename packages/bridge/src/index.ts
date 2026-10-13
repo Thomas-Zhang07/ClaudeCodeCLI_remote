@@ -133,14 +133,18 @@ export class Bridge {
    * locally, which is the read-only case.
    */
   async #startRelay(): Promise<void> {
-    const { repoUrl, repoToken, branch } = this.#config;
+    const { repoUrl, repoToken, outBranch, inBranch } = this.#config;
     if (!repoUrl) return;
 
     const relay = new RelaySync({
       repoUrl,
       token: repoToken,
-      branch,
-      cloneDir: join(this.#config.stateDir, 'repo'),
+      outBranch,
+      inBranch,
+      // Separate clones: a force-push on the outbound branch must not disturb
+      // the working tree holding un-consumed inbound prompts.
+      outCloneDir: join(this.#config.stateDir, 'repo-out'),
+      inCloneDir: join(this.#config.stateDir, 'repo-in'),
       outDir: this.#config.outDir,
       log: (message) => process.stderr.write(`[relay] ${message}\n`),
     });
