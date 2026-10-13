@@ -18,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import type {
   ChunkEndSentinel,
@@ -130,14 +130,24 @@ function delay(ms: number): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export interface ChunkWriterOptions {
-  /** Session directory. Created if absent. */
+  /** Session directory. Created if absent. This is the published tree. */
   dir: string;
   maxChunkBytes?: number;
   /** Retained bytes for this session before the oldest chunk is deleted. */
   retainBytes?: number;
+  /**
+   * Where to keep the writer's own bookkeeping.
+   *
+   * Deliberately **outside** `dir`, and therefore outside the published tree.
+   * It is rewritten on every seal, so publishing it would add a changed blob to
+   * every publish — churn in the one place this design is trying to minimise —
+   * and it is of no use to a reader, which learns the chunk range from
+   * `head.json` instead.
+   */
+  manifestPath?: string;
 }
 
-/** Internal bookkeeping. Not published; the reader uses `head.json`. */
+/** Writer bookkeeping for crash recovery. Never published. */
 interface PersistedManifest extends ChunkManifest {
   droppedEvents: number;
 }
@@ -146,6 +156,7 @@ export class ChunkWriter {
   readonly #dir: string;
   readonly #maxChunkBytes: number;
   readonly #retainBytes: number;
+  readonly #manifestPath: string;
 
   #chunk = 1;
   #bytes = 0;
@@ -161,6 +172,7 @@ export class ChunkWriter {
     this.#dir = options.dir;
     this.#maxChunkBytes = options.maxChunkBytes ?? DEFAULT_CHUNK_BYTES;
     this.#retainBytes = options.retainBytes ?? DEFAULT_RETAIN_BYTES;
+    this.#manifestPath = options.manifestPath ?? join(options.dir, 'manifest.json');
   }
 
   get chunkNumber(): number {
@@ -211,11 +223,11 @@ export class ChunkWriter {
   async open(sessionId: string): Promise<void> {
     this.#sessionId = sessionId;
     await mkdir(this.#dir, { recursive: true });
+    await mkdir(dirname(this.#manifestPath), { recursive: true }).catch(() => {});
 
-    const manifestPath = join(this.#dir, 'manifest.json');
-    if (existsSync(manifestPath)) {
+    if (existsSync(this.#manifestPath)) {
       try {
-        const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as PersistedManifest;
+        const parsed = JSON.parse(await readFile(this.#manifestPath, 'utf8')) as PersistedManifest;
         if (Array.isArray(parsed.chunks)) {
           this.#sealed = parsed.chunks;
           this.#droppedEvents = parsed.droppedEvents ?? 0;
@@ -340,7 +352,7 @@ export class ChunkWriter {
       chunks: this.#sealed,
       droppedEvents: this.#droppedEvents,
     };
-    await atomicWriteJson(join(this.#dir, 'manifest.json'), manifest);
+    await atomicWriteJson(this.#manifestPath, manifest);
   }
 
   /** Seal any partial chunk and flush the manifest. */

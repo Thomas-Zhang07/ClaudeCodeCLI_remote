@@ -78,8 +78,15 @@ retained" rather than "stream gap", because a gap means something is broken.
 
 | View | Polls | Cadence |
 |---|---|---|
-| Session list | `out/index.json` | slow — it rarely changes |
-| Session open | `sessions/<id>/head.json` | 10s active, slower when idle, stopped when hidden |
+| Session list | `out/index.json` | 60s — it rarely changes |
+| Session open | `sessions/<id>/head.json` | ~15s while the session is active, 60s otherwise |
+
+Polling stops entirely while the page is hidden and resumes on the next
+`visibilitychange`, because a backgrounded phone is frozen anyway and every
+request costs quota.
+
+Polling faster than the publish cadence buys nothing: publishing happens on turn
+boundaries, so most polls would return `304` — which Gitee charges for.
 
 Chunks are fetched by number for whatever is missing in the retained range.
 Two hazards are handled explicitly:

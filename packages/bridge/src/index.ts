@@ -14,7 +14,7 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -339,8 +339,19 @@ export class Bridge {
     }
   }
 
+  /** True when a session directory physically holds at least one chunk. */
+  async #hasChunks(dir: string): Promise<boolean> {
+    try {
+      const names = await readdir(dir);
+      return names.some((n) => n.startsWith('events-') && n.endsWith('.jsonl'));
+    } catch {
+      return false;
+    }
+  }
+
   async #addSession(discovered: DiscoveredSession): Promise<void> {
     const sessionDir = join(this.#config.outDir, 'sessions', discovered.sessionId);
+    const manifestPath = join(this.#config.stateDir, 'manifests', `${discovered.sessionId}.json`);
 
     // Offsets and output are restored together, or not at all.
     //
@@ -349,7 +360,17 @@ export class Bridge {
     // those events were already consumed, so the relay stays empty and nothing
     // reports a problem. Treating a missing output as "never seen" makes the
     // output the authority and lets it be rebuilt.
-    const hasOutput = existsSync(join(sessionDir, 'manifest.json'));
+    // Checked against the chunks themselves rather than the manifest, because
+    // the manifest now lives outside the output tree and would survive its
+    // deletion — reporting "output present" for a session whose chunks are gone.
+    const hasOutput = await this.#hasChunks(sessionDir);
+
+    // A surviving manifest describes chunks that no longer exist; discard it so
+    // the range it reports cannot be published.
+    if (!hasOutput) {
+      await rm(manifestPath, { force: true }).catch(() => {});
+    }
+
     const saved = hasOutput ? this.#persisted.sessions[discovered.sessionId] : undefined;
     const savedTail = hasOutput ? this.#persisted.tails[discovered.transcriptPath] : undefined;
 
@@ -362,6 +383,10 @@ export class Bridge {
     const chunker = new ChunkWriter({
       dir: sessionDir,
       retainBytes: this.#config.retainBytes,
+      // Bookkeeping lives outside the published tree: it is rewritten on every
+      // seal, and publishing it would add a changed blob to every publish for
+      // the reader to ignore.
+      manifestPath,
     });
     await chunker.open(discovered.sessionId);
 
@@ -480,6 +505,12 @@ export class Bridge {
     for (const event of events) {
       await runtime.chunker.append(event);
       this.#relayDirty = true;
+      // Appending moves the chunk range, and `head.json` is what tells the
+      // reader about it. Leaving this to the aggregator's own dirty flag would
+      // mean a turn that only streams text never republishes its head — the
+      // reader would poll, see nothing had changed, and never fetch the chunks
+      // that had actually been written.
+      runtime.stateDirty = true;
       if (PUBLISH_TRIGGERS.has(event.kind)) this.#schedulePublish();
     }
   }

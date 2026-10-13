@@ -116,6 +116,28 @@ range. A range is O(1) however much history exists, which is exactly what a
 listing could not be. Retention (rolling ~10 MB per session, oldest chunk
 deleted) bounds the relay itself. See `docs/RELAY-DESIGN.md`.
 
+### 17. The reader's cache is smaller than the retention window
+
+The phone caches fetched chunks in `localStorage`, bounded at ~3 MB, while a
+session retains ~10 MB. A large session therefore cannot be held whole, and
+because assembly runs contiguously from `chunkFirst`, losing the *oldest* cached
+chunk blocks the timeline until it is refetched.
+
+**Status:** pre-existing, but it matters more now that chunks are the only thing
+cached. IndexedDB is the real fix.
+
+### 18. The sentinel's CRC is weak and was silently changed once
+
+`crc32` covers `"<firstSeq>:<lines>"`, which the reader can derive from the chunk
+itself — so it detects truncation, not corruption. It is also a protocol detail
+shared by two languages, and it **was changed in M8 without the reader being
+updated**, so every chunk would have failed validation.
+
+The stronger check in practice is `sentinel.lines === events.length`.
+
+**Status:** formats verified matching. Worth a shared fixture if either side
+changes again.
+
 ### 15. Publishing on turn boundaries means no live streaming
 
 A deliberate trade, chosen knowingly: reaching 10 s freshness over git push
