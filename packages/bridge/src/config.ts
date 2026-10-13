@@ -33,8 +33,22 @@ export interface BridgeConfig {
   inBranch: string;
   secret: string | null;
 
-  pushIntervalMs: number;
+  /**
+   * Minimum gap between publishes.
+   *
+   * Not a polling interval: publishing is driven by turn boundaries and
+   * attention signals, and this only coalesces the bursts those produce. Push
+   * frequency is the binding constraint on repository growth — see
+   * docs/RELAY-DESIGN.md — so this is a floor, never a schedule.
+   */
+  pushMinIntervalMs: number;
+  /** How often the bridge checks for prompts written by the phone. */
   pollIntervalMs: number;
+
+  /** Bytes retained per session. Oldest chunks are deleted past this. */
+  retainBytes: number;
+  /** Sessions kept in the relay index. */
+  maxSessions: number;
 
   allowInjection: boolean;
   /** Prompts older than this are refused, bounding the value of a captured file. */
@@ -91,8 +105,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
     inBranch: env['CCR_IN_BRANCH'] ?? 'relay-in',
     secret: env['CCR_SECRET'] ?? null,
 
-    pushIntervalMs: num(env['CCR_PUSH_MS'], 10_000),
+    pushMinIntervalMs: num(env['CCR_PUSH_MIN_MS'], 5_000),
     pollIntervalMs: num(env['CCR_POLL_MS'], 10_000),
+
+    retainBytes: num(env['CCR_RETAIN_BYTES'], 10 * 1024 * 1024),
+    maxSessions: num(env['CCR_MAX_SESSIONS'], 50),
 
     allowInjection: bool(env['CCR_ALLOW_INJECTION']),
     promptMaxAgeMs: num(env['CCR_PROMPT_MAX_AGE_MS'], 10 * 60 * 1000),

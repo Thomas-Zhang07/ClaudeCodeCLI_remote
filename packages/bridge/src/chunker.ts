@@ -1,24 +1,23 @@
 /**
- * Append-only chunk writer.
- *
- * Events are serialized into `events-NNNN.jsonl` under a session directory.
+ * Append-only chunk writer with rolling retention.
  *
  * The integrity rules, and why each exists:
  *
- *  - **A sealed chunk is never rewritten.** The phone caches by chunk number, so
- *    rewriting one would silently desynchronise it. Fresh numbers only.
+ *  - **A sealed chunk is never rewritten.** The reader caches by chunk number
+ *    and by content, so rewriting one would desynchronise it silently. Fresh
+ *    numbers only — retention deletes whole chunks, it never edits one.
  *  - **A chunk is only advertised once it carries a terminating sentinel.** The
  *    open chunk is deliberately incomplete, so a crash mid-write leaves
  *    something the reader discards rather than half-believes.
- *  - **`manifest.json` carries a digest and a sequence range per chunk**, letting
- *    the reader verify both the bytes and the continuity of the stream.
- *  - **`state.json` advertises `chunkLast` only after the chunk is sealed and
- *    flushed**, so it can never point at something the reader cannot fetch.
+ *  - **Retention deletes the oldest chunk rather than compacting.** An archive
+ *    file trimmed from the front would be rewritten on every pass, and a
+ *    rewritten file can never be cached by the reader — which is the whole
+ *    reason chunks are chunked. Deleting keeps every survivor immutable.
  */
 
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type {
@@ -26,13 +25,23 @@ import type {
   ChunkEntry,
   ChunkManifest,
   NormalizedEvent,
-  SessionState,
 } from '@ccr/shared';
 
 export const DEFAULT_CHUNK_BYTES = 256 * 1024;
+export const DEFAULT_RETAIN_BYTES = 10 * 1024 * 1024;
 
 export function chunkFilename(n: number): string {
   return `events-${String(n).padStart(4, '0')}.jsonl`;
+}
+
+/** What the reader needs to know about a session's retained events. */
+export interface ChunkRange {
+  chunkFirst: number;
+  chunkLast: number;
+  firstSeq: number;
+  lastSeq: number;
+  retainedBytes: number;
+  droppedEvents: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,8 +89,6 @@ const TRANSIENT_RENAME_ERRORS = new Set(['EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY'
 /**
  * Write a file so a reader never observes a partial one.
  *
- * Writes alongside the target then renames, which is atomic within a volume.
- *
  * The retry loop exists because of Windows: replacing a file that another
  * process momentarily holds open fails with EPERM, and that happens routinely
  * here — a virus scanner or the search indexer touching a file the instant it is
@@ -110,12 +117,12 @@ export async function atomicWrite(path: string, data: string | Buffer): Promise<
   throw lastError;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   await atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -126,27 +133,34 @@ export interface ChunkWriterOptions {
   /** Session directory. Created if absent. */
   dir: string;
   maxChunkBytes?: number;
-  /** Chunk number to start at. Normally recovered from the manifest. */
-  startChunk?: number;
+  /** Retained bytes for this session before the oldest chunk is deleted. */
+  retainBytes?: number;
+}
+
+/** Internal bookkeeping. Not published; the reader uses `head.json`. */
+interface PersistedManifest extends ChunkManifest {
+  droppedEvents: number;
 }
 
 export class ChunkWriter {
   readonly #dir: string;
   readonly #maxChunkBytes: number;
+  readonly #retainBytes: number;
 
   #chunk = 1;
   #bytes = 0;
   #lines = 0;
   #firstSeq = 0;
-  #lastSeq = 0;
   #sealed: ChunkEntry[] = [];
+  #sealedBytes = 0;
+  #droppedEvents = 0;
   #ready = false;
   #sessionId = '';
 
   constructor(options: ChunkWriterOptions) {
     this.#dir = options.dir;
     this.#maxChunkBytes = options.maxChunkBytes ?? DEFAULT_CHUNK_BYTES;
-    if (options.startChunk) this.#chunk = options.startChunk;
+    this.#retainBytes = options.retainBytes ?? DEFAULT_RETAIN_BYTES;
   }
 
   get chunkNumber(): number {
@@ -154,11 +168,35 @@ export class ChunkWriter {
   }
 
   get lastSeq(): number {
-    return this.#lastSeq;
+    return this.#sealed.at(-1)?.lastSeq ?? this.#firstSeq - 1 + this.#lines;
   }
 
-  get manifest(): ChunkManifest {
-    return { sessionId: this.#sessionId, chunks: [...this.#sealed] };
+  /**
+   * What the reader polls: which chunks exist and what they cover.
+   *
+   * `chunkLast` is the highest chunk that actually holds events, which is not
+   * the same as the chunk being written to — after a seal, the writer has
+   * already moved on to the next number, and advertising that would send the
+   * reader after a file that does not exist.
+   *
+   * An empty range is reported as `chunkLast < chunkFirst`, so a session with
+   * nothing recorded yet asks the reader to fetch nothing at all.
+   */
+  get range(): ChunkRange {
+    const oldest = this.#sealed[0];
+    const newestSealed = this.#sealed.at(-1);
+    const hasOpenEvents = this.#lines > 0;
+
+    return {
+      chunkFirst: oldest?.n ?? this.#chunk,
+      chunkLast: hasOpenEvents ? this.#chunk : (newestSealed?.n ?? this.#chunk - 1),
+      firstSeq: oldest?.firstSeq ?? this.#firstSeq,
+      lastSeq: hasOpenEvents
+        ? this.#firstSeq + this.#lines - 1
+        : (newestSealed?.lastSeq ?? 0),
+      retainedBytes: this.#sealedBytes + this.#bytes,
+      droppedEvents: this.#droppedEvents,
+    };
   }
 
   /**
@@ -177,16 +215,18 @@ export class ChunkWriter {
     const manifestPath = join(this.#dir, 'manifest.json');
     if (existsSync(manifestPath)) {
       try {
-        const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as ChunkManifest;
+        const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as PersistedManifest;
         if (Array.isArray(parsed.chunks)) {
           this.#sealed = parsed.chunks;
-          const highest = this.#sealed.reduce((max, c) => Math.max(max, c.n), 0);
-          this.#chunk = highest + 1;
+          this.#droppedEvents = parsed.droppedEvents ?? 0;
+          this.#sealedBytes = this.#sealed.reduce((sum, c) => sum + c.bytes, 0);
+          this.#chunk = this.#sealed.reduce((max, c) => Math.max(max, c.n), 0) + 1;
         }
       } catch {
-        // A corrupt manifest is recoverable: start a fresh chunk above whatever
-        // chunk files exist, so nothing already written is overwritten.
+        // A corrupt manifest is recoverable: start numbering above whatever chunk
+        // files exist, so nothing already written is overwritten.
         this.#sealed = [];
+        this.#sealedBytes = 0;
         this.#chunk = 1;
       }
     }
@@ -202,7 +242,6 @@ export class ChunkWriter {
           if (parsed.t === 'chunk_end') continue;
           if (typeof parsed.seq === 'number') {
             if (this.#firstSeq === 0) this.#firstSeq = parsed.seq;
-            this.#lastSeq = Math.max(this.#lastSeq, parsed.seq);
           }
           this.#lines++;
           this.#bytes += Buffer.byteLength(`${trimmed}\n`, 'utf8');
@@ -226,7 +265,6 @@ export class ChunkWriter {
     const size = Buffer.byteLength(line, 'utf8');
 
     if (this.#firstSeq === 0) this.#firstSeq = event.seq;
-    this.#lastSeq = Math.max(this.#lastSeq, event.seq);
 
     await writeFile(join(this.#dir, chunkFilename(this.#chunk)), line, { flag: 'a' });
     this.#bytes += size;
@@ -238,7 +276,7 @@ export class ChunkWriter {
   }
 
   /**
-   * Terminate the current chunk and record it in the manifest.
+   * Terminate the current chunk, record it, and apply retention.
    *
    * The sentinel is written last so its presence proves the chunk is complete.
    */
@@ -250,7 +288,7 @@ export class ChunkWriter {
       t: 'chunk_end',
       n: this.#chunk,
       lines: this.#lines,
-      crc32: crc32(Buffer.from(`${this.#firstSeq}:${this.#lastSeq}:${this.#lines}`)),
+      crc32: crc32(Buffer.from(`${this.#firstSeq}:${this.#lines}`)),
     };
     await writeFile(path, `${JSON.stringify(sentinel)}\n`, { flag: 'a' });
 
@@ -260,29 +298,65 @@ export class ChunkWriter {
       sha256: sha256(bytes),
       bytes: bytes.length,
       firstSeq: this.#firstSeq,
-      lastSeq: this.#lastSeq,
+      lastSeq: this.#firstSeq + this.#lines - 1,
       lines: this.#lines,
     };
 
     this.#sealed.push(entry);
-    await atomicWriteJson(join(this.#dir, 'manifest.json'), this.manifest);
+    this.#sealedBytes += entry.bytes;
 
     this.#chunk += 1;
     this.#bytes = 0;
     this.#lines = 0;
     this.#firstSeq = 0;
 
+    await this.#enforceRetention();
+    await this.#persistManifest();
+
     return entry;
   }
 
-  /** Seal any partial chunk and write the session state. */
-  async finish(state: SessionState): Promise<void> {
-    const entry = await this.seal();
-    const chunkLast = entry ? entry.n : this.#sealed.at(-1)?.n;
-    await atomicWriteJson(join(this.#dir, 'state.json'), {
-      ...state,
-      ...(chunkLast !== undefined ? { chunkLast } : {}),
-    } satisfies SessionState);
+  /**
+   * Delete the oldest chunks until the session fits its budget.
+   *
+   * The newest chunk is never deleted, even alone over budget: a session that
+   * retains nothing cannot be read at all, and one enormous chunk is better than
+   * an empty session.
+   */
+  async #enforceRetention(): Promise<void> {
+    while (this.#sealedBytes + this.#bytes > this.#retainBytes && this.#sealed.length > 1) {
+      const oldest = this.#sealed.shift();
+      if (!oldest) break;
+
+      await rm(join(this.#dir, chunkFilename(oldest.n)), { force: true }).catch(() => {});
+      this.#sealedBytes -= oldest.bytes;
+      this.#droppedEvents += oldest.lines;
+    }
+  }
+
+  async #persistManifest(): Promise<void> {
+    const manifest: PersistedManifest = {
+      sessionId: this.#sessionId,
+      chunks: this.#sealed,
+      droppedEvents: this.#droppedEvents,
+    };
+    await atomicWriteJson(join(this.#dir, 'manifest.json'), manifest);
+  }
+
+  /** Seal any partial chunk and flush the manifest. */
+  async finish(): Promise<void> {
+    await this.seal();
+    await this.#persistManifest();
+  }
+
+  /** Total bytes on disk for this session, for diagnostics. */
+  async diskBytes(): Promise<number> {
+    let total = 0;
+    for (const entry of this.#sealed) {
+      const info = await stat(join(this.#dir, chunkFilename(entry.n))).catch(() => null);
+      if (info) total += info.size;
+    }
+    return total + this.#bytes;
   }
 
   sealCount(): number {

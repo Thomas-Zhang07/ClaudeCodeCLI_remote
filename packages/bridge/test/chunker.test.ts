@@ -1,10 +1,11 @@
 import { mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { ChunkWriter, chunkFilename, crc32, sha256 } from '../src/chunker.js';
-import type { ChunkManifest, NormalizedEvent, SessionState } from '@ccr/shared';
+import type { ChunkEntry, ChunkManifest, NormalizedEvent, SessionState } from '@ccr/shared';
 
 let dir: string;
 
@@ -124,18 +125,81 @@ describe('ChunkWriter', () => {
     }
   });
 
-  it('advertises chunkLast in state so the reader never chases a missing chunk', async () => {
+  it('reports a chunk range the reader can trust', async () => {
+    // The reader has no file listing; this range is how it knows what exists.
     const w = new ChunkWriter({ dir });
     await w.open('sess-1');
     await w.append(event(1));
-    await w.finish(state());
+    await w.finish();
 
-    const written = JSON.parse(await readFile(join(dir, 'state.json'), 'utf8'));
-    expect(written.chunkLast).toBe(1);
+    const range = w.range;
+    expect(range.chunkFirst).toBe(1);
+    expect(range.chunkLast).toBe(1);
+    expect(range.lastSeq).toBe(1);
+    expect(range.droppedEvents).toBe(0);
 
     // The advertised chunk must actually exist and be sealed.
     const lines = (await readFile(join(dir, chunkFilename(1)), 'utf8')).trim().split('\n');
     expect(JSON.parse(lines.at(-1)!).t).toBe('chunk_end');
+  });
+
+  describe('retention', () => {
+    it('deletes the oldest chunk and advances chunkFirst', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120, retainBytes: 400 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 40; i++) await w.append(event(i, 60));
+      await w.finish();
+
+      const range = w.range;
+      expect(range.chunkFirst).toBeGreaterThan(1);
+      expect(range.droppedEvents).toBeGreaterThan(0);
+      expect(range.retainedBytes).toBeLessThanOrEqual(400 + 200);
+
+      // Pruned chunks are gone from disk, not rewritten.
+      expect(existsSync(join(dir, chunkFilename(1)))).toBe(false);
+    });
+
+    it('never deletes the newest chunk, even alone over budget', async () => {
+      // A session that retains nothing cannot be read at all. One oversized
+      // chunk is better than an empty session.
+      const w = new ChunkWriter({ dir, maxChunkBytes: 60, retainBytes: 1 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 4; i++) await w.append(event(i, 40));
+      await w.finish();
+
+      expect(w.range.chunkLast).toBeGreaterThanOrEqual(w.range.chunkFirst);
+      expect(existsSync(join(dir, chunkFilename(w.range.chunkLast)))).toBe(true);
+    });
+
+    it('leaves survivors sealed and contiguous', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120, retainBytes: 400 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 30; i++) await w.append(event(i, 60));
+      await w.finish();
+
+      const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'));
+      const kept: ChunkEntry[] = manifest.chunks;
+
+      expect(kept.length).toBeGreaterThan(0);
+      for (let i = 1; i < kept.length; i++) {
+        expect(kept[i]!.firstSeq).toBe(kept[i - 1]!.lastSeq + 1);
+      }
+      // Every surviving chunk is still terminable and complete.
+      for (const chunk of kept) {
+        const lines = (await readFile(join(dir, chunkFilename(chunk.n)), 'utf8')).trim().split('\n');
+        expect(JSON.parse(lines.at(-1)!).t).toBe('chunk_end');
+      }
+    });
+
+    it('makes no change when the session is under budget', async () => {
+      const w = new ChunkWriter({ dir, retainBytes: 10 * 1024 * 1024 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 5; i++) await w.append(event(i, 10));
+      await w.finish();
+
+      expect(w.range.chunkFirst).toBe(1);
+      expect(w.range.droppedEvents).toBe(0);
+    });
   });
 
   it('survives many rapid seals, which stresses rename-over-existing', async () => {
@@ -189,7 +253,9 @@ describe('ChunkWriter', () => {
       const second = new ChunkWriter({ dir });
       await second.open('sess-1');
       expect(second.chunkNumber).toBe(2);
-      expect(second.lastSeq).toBe(0);
+      // The highest sequence written, recovered from the sealed chunk — not a
+      // counter reset to zero, which would let the writer reissue a sequence.
+      expect(second.lastSeq).toBe(1);
     });
   });
 });

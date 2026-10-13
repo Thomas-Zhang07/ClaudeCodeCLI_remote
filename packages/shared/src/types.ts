@@ -187,6 +187,37 @@ export interface SessionState {
 
 export type SessionStatus = 'active' | 'waiting' | 'idle' | 'ended';
 
+/**
+ * The per-session file the reader polls while a session is open.
+ *
+ * Separate from the session list because the two change at different rates and
+ * are read at different times: the list is loaded once while browsing, this is
+ * polled only for the session actually on screen. A single combined index would
+ * make every session's activity invalidate the cache of a reader watching one.
+ *
+ * Carries the chunk range so the reader never needs a file listing — chunks are
+ * immutable and sequential, so knowing which numbers exist is enough.
+ */
+export interface SessionHead extends SessionState {
+  /** Lowest chunk number still retained. Above 1 means history was pruned. */
+  chunkFirst: number;
+  /**
+   * Highest chunk number that actually contains events.
+   *
+   * `chunkLast < chunkFirst` means the session has recorded nothing yet — fetch
+   * nothing, rather than requesting a chunk that does not exist.
+   */
+  chunkLast: number;
+  /** Lowest event sequence still retained. */
+  firstSeq: number;
+  /** Highest event sequence written. */
+  lastSeq: number;
+  /** Bytes currently retained for this session. */
+  retainedBytes: number;
+  /** Events dropped by retention, so the reader can say so plainly. */
+  droppedEvents: number;
+}
+
 export interface CostState {
   totalCostUSD: number;
   totalAPIDurationMs: number;

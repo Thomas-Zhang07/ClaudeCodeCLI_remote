@@ -13,13 +13,15 @@
  *    agents, which is comparatively expensive.
  */
 
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
   type NormalizedEvent,
   type RelayIndex,
   type RegistryEntry,
+  type SessionHead,
   type SessionIndexEntry,
 } from '@ccr/shared';
 
@@ -37,6 +39,16 @@ import {
 } from './discovery.js';
 import { SessionAggregator } from './session.js';
 import { Tailer, type TailState } from './tailer.js';
+
+/**
+ * The only events that justify a publish.
+ *
+ * A turn ending, a session blocking on input, and a prompt's fate are the
+ * moments worth waking a phone for. Streaming prose is not: it would mean
+ * publishing continuously through a long turn, and push frequency — not the
+ * shape of the data — is what bounds how large the relay grows.
+ */
+const PUBLISH_TRIGGERS: ReadonlySet<string> = new Set(['turn_end', 'attention', 'injection']);
 
 interface PersistedState {
   version: 1;
@@ -82,6 +94,7 @@ export class Bridge {
   #seenPrompts = new Set<string>();
   /** Pids of sessions launched through `ccr`, refreshed with the registry. */
   #controlledPids = new Set<number>();
+  #publishTimer: NodeJS.Timeout | null = null;
 
   constructor(config: BridgeConfig) {
     this.#config = config;
@@ -118,15 +131,33 @@ export class Bridge {
     );
 
     if (this.#relay) {
+      // No periodic publish. Publishing is driven by turn boundaries and
+      // attention signals; a timer would push continuously during a long turn
+      // for no benefit the reader can see, and push frequency is what bounds
+      // repository growth. See docs/RELAY-DESIGN.md.
       this.#timers.push(
-        setInterval(() => {
-          void this.#publish();
-        }, this.#config.pushIntervalMs),
         setInterval(() => {
           void this.#pollInbound();
         }, this.#config.pollIntervalMs),
       );
     }
+  }
+
+  /**
+   * Coalesce a publish.
+   *
+   * Turn boundaries arrive in bursts — a session can end several turns in quick
+   * succession — and each publish rewrites the branch. This collapses them into
+   * one, and the floor is a minimum gap rather than an interval: nothing is
+   * published unless something actually asked for it.
+   */
+  #schedulePublish(): void {
+    if (!this.#relay || this.#publishTimer) return;
+    this.#publishTimer = setTimeout(() => {
+      this.#publishTimer = null;
+      void this.#publish();
+    }, this.#config.pushMinIntervalMs);
+    this.#publishTimer.unref?.();
   }
 
   /**
@@ -253,7 +284,8 @@ export class Bridge {
 
     // Seal every open chunk so nothing is left unadvertised.
     for (const runtime of this.#sessions.values()) {
-      await runtime.chunker.finish(runtime.aggregator.state).catch(() => {});
+      await runtime.chunker.finish().catch(() => {});
+      await this.#writeHead(runtime).catch(() => {});
     }
     await this.#persist();
   }
@@ -308,16 +340,28 @@ export class Bridge {
   }
 
   async #addSession(discovered: DiscoveredSession): Promise<void> {
-    const saved = this.#persisted.sessions[discovered.sessionId];
+    const sessionDir = join(this.#config.outDir, 'sessions', discovered.sessionId);
+
+    // Offsets and output are restored together, or not at all.
+    //
+    // If the output is missing but a saved offset survives, the two disagree
+    // permanently: the writer starts again at chunk 1 while the tailer believes
+    // those events were already consumed, so the relay stays empty and nothing
+    // reports a problem. Treating a missing output as "never seen" makes the
+    // output the authority and lets it be rebuilt.
+    const hasOutput = existsSync(join(sessionDir, 'manifest.json'));
+    const saved = hasOutput ? this.#persisted.sessions[discovered.sessionId] : undefined;
+    const savedTail = hasOutput ? this.#persisted.tails[discovered.transcriptPath] : undefined;
 
     const tailer = new Tailer(
       discovered.transcriptPath,
       { coldStartBytes: this.#config.coldStartBytes },
-      this.#persisted.tails[discovered.transcriptPath],
+      savedTail,
     );
 
     const chunker = new ChunkWriter({
-      dir: join(this.#config.outDir, 'sessions', discovered.sessionId),
+      dir: sessionDir,
+      retainBytes: this.#config.retainBytes,
     });
     await chunker.open(discovered.sessionId);
 
@@ -403,10 +447,7 @@ export class Bridge {
     const main = await runtime.tailer.poll();
     for (const line of main) {
       const result = runtime.aggregator.ingest(line, null);
-      for (const event of result.events) {
-        await runtime.chunker.append(event);
-        this.#relayDirty = true;
-      }
+      await this.#append(runtime, result.events);
       if (result.stateDirty) runtime.stateDirty = true;
     }
 
@@ -417,25 +458,39 @@ export class Bridge {
         // sessionId, so without the agent id these events would be
         // indistinguishable from the main thread's.
         const result = runtime.aggregator.ingest(line, agent.agentId);
-        for (const event of result.events) {
-          await runtime.chunker.append(event);
-          this.#relayDirty = true;
-        }
+        await this.#append(runtime, result.events);
         if (result.stateDirty) runtime.stateDirty = true;
       }
     }
 
     if (runtime.stateDirty) {
-      await atomicWriteJson(
-        join(this.#config.outDir, 'sessions', runtime.sessionId, 'state.json'),
-        runtime.aggregator.state,
-      );
-      await atomicWriteJson(
-        join(this.#config.outDir, 'sessions', runtime.sessionId, 'subagents.json'),
-        runtime.aggregator.subagentTree(),
-      );
+      await this.#writeHead(runtime);
       runtime.stateDirty = false;
     }
+  }
+
+  /**
+   * Write an event and decide whether it justifies a publish.
+   *
+   * Only turn boundaries and attention signals do. Everything else accumulates
+   * locally until one of those arrives, which is what keeps pushes rare enough
+   * for the repository to stay small.
+   */
+  async #append(runtime: SessionRuntime, events: readonly NormalizedEvent[]): Promise<void> {
+    for (const event of events) {
+      await runtime.chunker.append(event);
+      this.#relayDirty = true;
+      if (PUBLISH_TRIGGERS.has(event.kind)) this.#schedulePublish();
+    }
+  }
+
+  /** Write the per-session file the reader polls while a session is open. */
+  async #writeHead(runtime: SessionRuntime): Promise<void> {
+    const dir = join(this.#config.outDir, 'sessions', runtime.sessionId);
+    const head: SessionHead = { ...runtime.aggregator.state, ...runtime.chunker.range };
+
+    await atomicWriteJson(join(dir, 'head.json'), head);
+    await atomicWriteJson(join(dir, 'subagents.json'), runtime.aggregator.subagentTree());
   }
 
   /** Publish the session list the phone reads first. */
@@ -444,7 +499,15 @@ export class Bridge {
     if (now - this.#lastIndexWrite < 2_000) return;
     this.#lastIndexWrite = now;
 
-    const sessions: SessionIndexEntry[] = [...this.#sessions.values()].map((runtime) => {
+    const sessions: SessionIndexEntry[] = [...this.#sessions.values()]
+      // Only relay what is worth looking at: a session with events, or one still
+      // running. Otherwise every transcript ever written on this machine appears
+      // in the phone's list as an empty entry.
+      .filter((runtime) => {
+        const state = runtime.aggregator.state;
+        return runtime.chunker.range.retainedBytes > 0 || state.status !== 'ended';
+      })
+      .map((runtime) => {
       const state = runtime.aggregator.state;
       return {
         sessionId: runtime.sessionId,
@@ -461,13 +524,44 @@ export class Bridge {
     // Most recently updated first — that is the order the phone wants.
     sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 
+    const { kept, dropped } = this.#applySessionCap(sessions);
+    for (const entry of dropped) await this.#forgetSession(entry.sessionId);
+
     const index: RelayIndex = {
       version: 1,
       generatedAt: new Date().toISOString(),
-      sessions,
+      sessions: kept,
       injectionEnabled: this.#config.allowInjection,
     };
     await atomicWriteJson(join(this.#config.outDir, 'index.json'), index);
+  }
+
+  /**
+   * Split the session list into what is kept and what falls past the cap.
+   *
+   * Active sessions are never counted against the cap or dropped: a limit that
+   * deletes a running session's history mid-turn is a bug, not a policy. The cap
+   * therefore bounds how much *finished* history accumulates, which is the part
+   * that would otherwise grow forever.
+   */
+  #applySessionCap(sessions: readonly SessionIndexEntry[]): {
+    kept: SessionIndexEntry[];
+    dropped: SessionIndexEntry[];
+  } {
+    const active = sessions.filter((s) => s.status !== 'ended');
+    const ended = sessions.filter((s) => s.status === 'ended');
+    const room = Math.max(0, this.#config.maxSessions - active.length);
+
+    return { kept: [...active, ...ended.slice(0, room)], dropped: ended.slice(room) };
+  }
+
+  /** Delete a session's relayed data and stop tracking it. */
+  async #forgetSession(sessionId: string): Promise<void> {
+    this.#sessions.delete(sessionId);
+    await rm(join(this.#config.outDir, 'sessions', sessionId), {
+      recursive: true,
+      force: true,
+    }).catch(() => {});
   }
 }
 
