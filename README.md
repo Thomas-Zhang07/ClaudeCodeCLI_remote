@@ -122,6 +122,7 @@ scripts/     helper scripts (page publishing, optional hook install)
 git clone https://github.com/Thomas-Zhang07/ClaudeCodeCLI_remote.git
 cd ClaudeCodeCLI_remote
 npm install
+npm install --prefix packages/phone   # the phone page has its own dependencies
 ```
 
 ### Configure
@@ -157,9 +158,20 @@ npm run bridge
 # or launch a controllable session (full TUI, prompts injectable)
 npm run ccr -- --cwd /path/to/project
 
-# phone UI, for development
-npm run phone:dev
+# phone UI
+npm run phone:dev      # local dev server
+npm run phone:build    # produces packages/phone/dist for deployment
 ```
+
+### The phone page
+
+A Vue 3 PWA. It talks to the Gitee API directly from the browser, so it needs an
+**https origin** — Web Crypto, which signs prompts, is only available in a secure
+context. Deploy `packages/phone/dist` anywhere that serves https; Netlify
+publishes it from this repository with no configuration.
+
+The page holds no data of its own. You enter the repository owner, name, token
+and signing secret once, and they are kept in the browser's `localStorage`.
 
 ---
 
@@ -186,7 +198,7 @@ Mitigations in place:
 - [ ] **M1** Transcript parser (`packages/shared`) with fixtures
 - [ ] **M2** Bridge — local tailing, normalization, chunk writing
 - [ ] **M3** Gitee sync — push, poll, rate-limit backoff, inbound reader
-- [ ] **M4** Phone PWA — session list, chat, diffs, subagent tree
+- [x] **M4** Phone PWA — session list, chat, diffs, subagent tree
 - [ ] **M5** `ccr` — ConPTY passthrough wrapper
 - [ ] **M6** Prompt injection with the permission-dialog guard
 - [ ] **M7** Optional hooks for lower-latency attention state

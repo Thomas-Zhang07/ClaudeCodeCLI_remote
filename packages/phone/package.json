@@ -1,0 +1,26 @@
+{
+  "name": "@ccr/phone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Phone-facing PWA that watches Claude Code sessions through a Gitee relay repository",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "icons": "node scripts/make-icons.mjs"
+  },
+  "dependencies": {
+    "vue": "^3.5.39"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.16",
+    "vite-plugin-pwa": "^1.3.0",
+    "vue-tsc": "^3.3.13"
+  }
+}

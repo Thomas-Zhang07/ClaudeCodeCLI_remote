@@ -102,6 +102,66 @@ the tail alone is guesswork; the reliable detector is a `PreToolUse`/
 
 ---
 
+## Open — surfaced by the phone build
+
+### 9. The tree listing grows without bound — biggest scaling risk
+
+Change detection polls the branch ref, then fetches `git/trees/relay-out?recursive=1`.
+Because publishing amends and force-pushes whenever events arrive, the head SHA
+moves often — so a "1 request per poll" steady state is really 1 ref request
+*plus* 1 tree request per poll, and **the tree payload grows with every session's
+entire history**, since every sealed chunk is a blob entry forever.
+
+The phone cannot prune; this needs chunk retention/archival on the PC side.
+
+**Status:** not implemented. This is the item most likely to bite first.
+
+### 10. A skewed phone clock makes prompts fail silently
+
+The bridge refuses prompts older than 10 minutes or more than 60 s in the future.
+A phone whose clock is off writes a file that is then rejected, and the UI shows
+"no acknowledgement seen" — with nothing anywhere identifying the cause.
+
+**Status:** not implemented. Options: a clock-skew check against the server's
+`Date` header, or surfacing rejections more loudly.
+
+### 11. `controllable` does not mean injection is enabled
+
+The composer is enabled by `state.controllable`, but `CCR_ALLOW_INJECTION` also
+has to be on for a prompt to actually run. With it off, prompts are accepted into
+`in/` and never executed, and the UI honestly reports them as unacknowledged
+rather than explaining why.
+
+**Status:** the bridge should publish its injection policy in `index.json` so the
+phone can say so plainly.
+
+### 12. Acknowledgement only resolves while the session is open
+
+`injection` events are only loaded with the session's timeline, so an
+acknowledgement arriving while the user is on the list view is not seen until
+they next open that session.
+
+**Status:** minor. Would need a lightweight per-session ack check.
+
+### 13. The blob cache is capped at ~3 MB (~12 chunks)
+
+Scrolling back through a long session refetches chunks, at one request plus
+preflight each. IndexedDB would remove the cap.
+
+**Status:** acceptable for now; revisit if sessions get long.
+
+### 14. The phone has never run against real Gitee
+
+Everything was verified against a purpose-built fake (see below), which is a
+strong test of the app but says nothing about Gitee's own behaviour. Specifically
+unverified: whether `git/trees` honours `page`/`per_page` (the client pages up to
+6×1000 and warns on `truncated`), the exact PUT response shape, and whether
+throttling arrives as 403 or 429 (both are handled identically). Also verified
+only in a desktop browser — real iOS/Android standalone behaviour is handled
+defensively but untested on a device.
+
+---
+
 ## Postponed deliberately
 
 - **Push notifications.** None. The page is checked on demand, by choice.
