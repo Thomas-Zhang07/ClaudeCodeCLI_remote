@@ -41,3 +41,7 @@ env/
 
 # Claude Code local state
 .claude/settings.local.json
+
+# Bridge runtime state: tail offsets, chunk output, lock files.
+# Regenerated on demand; never committed.
+.ccr-state/

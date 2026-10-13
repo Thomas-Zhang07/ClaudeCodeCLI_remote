@@ -29,11 +29,15 @@ export interface EventBase {
   ts: string;
   sessionId: string;
   /**
-   * Which agent produced this, or null for the main thread.
+   * The agent this event belongs to, or null for the main thread.
    *
    * Subagent transcripts carry the *parent's* sessionId, so sessionId alone
    * cannot distinguish them — this field is what keeps four concurrent agents
    * from being merged into one stream.
+   *
+   * For `subagent_start` and `subagent_stop` the event belongs to the subagent
+   * itself rather than to a producer, so those two narrow it to a non-null id.
+   * Every other kind reports where it came from.
    */
   agentId: string | null;
   kind: EventKind;

@@ -136,6 +136,34 @@ describe('parseTranscriptEntry', () => {
       expect(r.events).toEqual([]);
     });
 
+    it('does not publish a harness interruption as something the user said', () => {
+      for (const text of ['[Request interrupted by user]', '[Tool use rejected]']) {
+        const r = parseTranscriptEntry(
+          {
+            type: 'user',
+            timestamp: TS,
+            origin: { kind: 'human' },
+            message: { role: 'user', content: text },
+          },
+          ctx,
+        );
+        expect(r.events, text).toEqual([]);
+      }
+    });
+
+    it('still publishes a real prompt that merely starts with a bracket', () => {
+      const r = parseTranscriptEntry(
+        {
+          type: 'user',
+          timestamp: TS,
+          origin: { kind: 'human' },
+          message: { role: 'user', content: '[WIP] tidy the parser' },
+        },
+        ctx,
+      );
+      expect(only(r.events, 'user_prompt').text).toBe('[WIP] tidy the parser');
+    });
+
     it('does not treat a tool result as a prompt', () => {
       const r = parseTranscriptEntry(
         {
@@ -309,6 +337,17 @@ describe('parseTranscriptEntry', () => {
       );
       expect(r.events).toEqual([]);
       expect(r.state.title).toBe('ex5.tex template in lab5');
+    });
+
+    it('reports the entry timestamp so synthesized events can be stamped', () => {
+      const r = parseTranscriptEntry({ type: 'ai-title', timestamp: TS, aiTitle: 'X' }, ctx);
+      expect(r.ts).toBe(TS);
+      expect(r.events).toEqual([]);
+    });
+
+    it('reports no timestamp when the entry has none', () => {
+      const r = parseTranscriptEntry({ type: 'ai-title', aiTitle: 'X' }, ctx);
+      expect(r.ts).toBeNull();
     });
 
     it('emits a turn_end from turn_duration', () => {

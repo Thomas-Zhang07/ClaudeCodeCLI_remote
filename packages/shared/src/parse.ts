@@ -73,6 +73,16 @@ export const EDIT_TOOLS: ReadonlySet<string> = new Set<EditTool>([
 /** Tools that spawn a subagent. */
 export const AGENT_TOOLS: ReadonlySet<string> = new Set(['Agent', 'Task']);
 
+/**
+ * Harness-generated user turns.
+ *
+ * These appear as ordinary `user` entries, so without this they read as things
+ * the user typed. Kept narrow on purpose: a broad `/^\[/` would swallow prompts
+ * a user legitimately started with a bracket.
+ */
+const SYNTHETIC_PROMPT =
+  /^(?:<(?:system-reminder|command-name|local-command|user-prompt-submit-hook|bash-input|bash-stdout)|\[Request interrupted by user|\[Tool use rejected|\[Request cancelled)/;
+
 /** Entry types we never even look inside. */
 const IGNORED_TYPES: ReadonlySet<string> = new Set([
   'file-history-snapshot',
@@ -124,11 +134,19 @@ export interface ParsedEntry {
   events: EventDraft[];
   state: Partial<SessionState>;
   agents: AgentSignal[];
+  /**
+   * The entry's own timestamp, when it had one.
+   *
+   * Events synthesized outside the parsed-event stream — a title change, an
+   * agent signal — need a time, and the entry is the only honest source. Without
+   * this they would inherit whatever the caller last saw, or the epoch.
+   */
+  ts: string | null;
   /** Set when the line could not be used, for diagnostics. */
   skipped?: string;
 }
 
-const EMPTY: ParsedEntry = { events: [], state: {}, agents: [] };
+const EMPTY: ParsedEntry = { events: [], state: {}, agents: [], ts: null };
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -169,7 +187,8 @@ export function parseTranscriptEntry(raw: string | unknown, ctx: ParseContext): 
   if (!type) return { ...EMPTY, skipped: 'no-type' };
   if (IGNORED_TYPES.has(type)) return EMPTY;
 
-  const ts = str(entry['timestamp']) ?? new Date(0).toISOString();
+  const entryTs = str(entry['timestamp']);
+  const ts = entryTs ?? new Date(0).toISOString();
   const base = { ts, sessionId: ctx.sessionId, agentId: ctx.agentId };
   const events: EventDraft[] = [];
   const state: Partial<SessionState> = {};
@@ -211,7 +230,7 @@ export function parseTranscriptEntry(raw: string | unknown, ctx: ParseContext): 
       break;
   }
 
-  return { events, state, agents };
+  return { events, state, agents, ts: entryTs };
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +326,10 @@ function pushUserPrompt(
   const clean = redactText(text).trim();
   if (!clean) return;
 
-  // Skip synthetic content the harness injects as a user turn.
-  if (/^<(?:system-reminder|command-name|local-command)/.test(clean)) return;
+  // Skip content the harness injects as a user turn. These are real entries in
+  // the transcript but they are not things the user said, and publishing them
+  // would put words in their mouth on the phone.
+  if (SYNTHETIC_PROMPT.test(clean)) return;
 
   const origin = obj(entry['origin']);
   if (origin && str(origin['kind']) && str(origin['kind']) !== 'human') return;
