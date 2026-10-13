@@ -7,7 +7,8 @@
 
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export interface BridgeConfig {
   /** Root of the Claude Code transcript store. */
@@ -62,6 +63,38 @@ export interface BridgeConfig {
   rescanMs: number;
 }
 
+/**
+ * Where this installation lives.
+ *
+ * `dist/config.js` → the package root's parent, which is the checkout.
+ */
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+/**
+ * Load `.env` and build the configuration from it.
+ *
+ * The single entry point both `ccr` and the bridge use, so they cannot disagree
+ * about which state directory they are using — which would let `ccr` register
+ * itself somewhere the bridge never looks.
+ *
+ * **Anchored to the installation, never the working directory.** `ccr` is a
+ * global command and the bridge may be started from anywhere, so anything
+ * derived from the shell's location produces a different state directory, a
+ * different clone and a different `.env` for the same installation — silently,
+ * and with config simply missing rather than reported.
+ */
+export function bootstrapConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+  const envDir =
+    // The checkout's own configuration takes precedence...
+    loadEnvFile(PACKAGE_ROOT, 1) ??
+    // ...then a working directory that has one, for an unconventional layout...
+    loadEnvFile(process.cwd()) ??
+    // ...and failing both, a stable per-user location.
+    homedir();
+
+  return loadConfig(env, envDir);
+}
+
 function num(value: string | undefined, fallback: number): number {
   const n = value === undefined ? Number.NaN : Number.parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
@@ -73,31 +106,62 @@ function bool(value: string | undefined, fallback = false): boolean {
 }
 
 /**
- * Load `.env` if present.
+ * Find and load `.env`, searching upwards from the working directory.
  *
- * Uses the platform's own loader rather than a dependency. Failure is ignored:
- * a missing `.env` is the normal case for read-only monitoring, which needs no
- * relay credentials at all.
+ * Searching upwards rather than checking only the current directory, the way
+ * git finds `.git`: the bridge is commonly started from wherever the shell
+ * happens to be, and a `.env` that is silently not found leaves it running
+ * read-only with no relay, no token and no secret — and nothing says so.
+ *
+ * Uses the platform's own loader rather than a dependency. A missing or
+ * malformed file is not an error: read-only monitoring needs no credentials.
+ *
+ * @returns the directory the file was found in, which relative paths in it are
+ *   resolved against — so they mean the same thing from any working directory.
  */
-export function loadEnvFile(path = '.env'): void {
-  if (!existsSync(path)) return;
-  try {
-    const loader = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
-    if (typeof loader === 'function') loader.call(process, path);
-  } catch {
-    // A malformed .env should not stop the bridge from starting read-only.
+export function loadEnvFile(startDir = process.cwd(), maxLevels = 6): string | null {
+  let dir = resolve(startDir);
+
+  for (let level = 0; level < maxLevels; level++) {
+    const candidate = join(dir, '.env');
+    if (existsSync(candidate)) {
+      try {
+        const loader = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
+        if (typeof loader === 'function') loader.call(process, candidate);
+      } catch {
+        // A malformed .env should not stop the bridge from starting read-only.
+      }
+      return dir;
+    }
+
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
+
+  return null;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+/**
+ * @param baseDir what relative paths are resolved against — normally the
+ *   directory holding `.env`, never the working directory. Resolving against the
+ *   working directory means the same configuration produces a different state
+ *   directory depending on where the shell was, which fragments tail offsets and
+ *   clones, and lets two bridges run against one relay while each believes it is
+ *   the only one.
+ */
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  baseDir: string = process.cwd(),
+): BridgeConfig {
   const claudeDir = join(homedir(), '.claude');
-  const stateDir = resolve(env['CCR_STATE_DIR'] ?? '.ccr-state');
+  const stateDir = resolve(baseDir, env['CCR_STATE_DIR'] ?? '.ccr-state');
 
   return {
     projectsDir: env['CCR_PROJECTS_DIR'] ?? join(claudeDir, 'projects'),
     sessionsDir: env['CCR_SESSIONS_DIR'] ?? join(claudeDir, 'sessions'),
     stateDir,
-    outDir: resolve(env['CCR_OUT_DIR'] ?? join(stateDir, 'out')),
+    outDir: resolve(baseDir, env['CCR_OUT_DIR'] ?? join(stateDir, 'out')),
 
     repoUrl: env['CCR_REPO_URL'] ?? null,
     repoToken: env['CCR_REPO_TOKEN'] ?? null,

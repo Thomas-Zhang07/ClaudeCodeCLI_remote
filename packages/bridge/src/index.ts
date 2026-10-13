@@ -26,7 +26,7 @@ import {
 } from '@ccr/shared';
 
 import { ChunkWriter, atomicWriteJson } from './chunker.js';
-import { type BridgeConfig, loadConfig, loadEnvFile } from './config.js';
+import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { readControlled } from './control.js';
 import { isProcessAlive } from './control.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
@@ -673,8 +673,7 @@ function extractPromptId(raw: unknown): string | null {
 }
 
 export async function main(): Promise<void> {
-  loadEnvFile();
-  const config = loadConfig();
+  const config = bootstrapConfig();
   const bridge = new Bridge(config);
 
   await bridge.start();

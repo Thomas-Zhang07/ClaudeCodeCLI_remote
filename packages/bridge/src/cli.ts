@@ -24,7 +24,7 @@ import {
   type ControlMessage,
   type ControlReply,
 } from './control.js';
-import { loadConfig, loadEnvFile, type BridgeConfig } from './config.js';
+import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { injectPrompt } from './inject.js';
 import { attachTerminal, PtySession, resolveExecutable } from './pty.js';
 
@@ -165,8 +165,9 @@ export async function handleControlMessage(
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  loadEnvFile();
-  const config = loadConfig();
+  // Same resolution as the bridge: `ccr` registers itself in the state
+  // directory, and the bridge has to look in the same one.
+  const config = bootstrapConfig();
   const options = parseCcrArgs(argv);
 
   try {
