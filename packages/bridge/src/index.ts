@@ -59,7 +59,21 @@ const PUBLISH_TRIGGERS: ReadonlySet<string> = new Set(['turn_end', 'attention', 
 interface PersistedState {
   version: 1;
   tails: Record<string, TailState>;
-  sessions: Record<string, { seq: number }>;
+  sessions: Record<
+    string,
+    {
+      seq: number;
+      /**
+       * Kind of the last main-thread event, persisted across restarts.
+       *
+       * The injection guard reads this, so losing it is not cosmetic: on a
+       * restart the bridge replays nothing for a session whose transcript has
+       * not changed since, leaving this null and the guard refusing every
+       * prompt until that session happens to emit something new.
+       */
+      lastMainKind?: string | null;
+    }
+  >;
   /**
    * Prompts already evaluated, so a rejected one is reported once rather than
    * on every poll. They are deliberately not deleted — see `#pollInbound`.
@@ -331,7 +345,15 @@ export class Bridge {
       controllable: Boolean(registration),
       lastMainKind: runtime?.lastMainKind ?? null,
     });
-    if (refusal) return refuse('rejected', refusal);
+    if (refusal) {
+      // Spell out the mid-turn case. It is the one a person will actually hit,
+      // and "session-not-idle" alone gives them nothing to act on.
+      const detail =
+        refusal === 'session-not-idle'
+          ? 'session-not-idle: it is mid-turn. Send again once the turn finishes.'
+          : refusal;
+      return refuse('rejected', detail);
+    }
 
     // The guard has already refused when either is missing; repeating it here is
     // what narrows the types for the rest of the function.
@@ -456,7 +478,10 @@ export class Bridge {
     for (const runtime of this.#sessions.values()) {
       tails[runtime.tailer.path] = runtime.tailer.getState();
       for (const agent of runtime.agents.values()) tails[agent.tailer.path] = agent.tailer.getState();
-      sessions[runtime.sessionId] = { seq: runtime.aggregator.seq };
+      sessions[runtime.sessionId] = {
+        seq: runtime.aggregator.seq,
+        lastMainKind: runtime.lastMainKind,
+      };
     }
 
     this.#persisted = { version: 1, tails, sessions, seenPrompts: [...this.#seenPrompts] };
@@ -543,7 +568,10 @@ export class Bridge {
       agents: new Map(),
       stateDirty: true,
       lastAgentScan: 0,
-      lastMainKind: null,
+      // Restored rather than started null: the guard depends on it, and a
+      // session idle since before this process began would otherwise look
+      // permanently busy.
+      lastMainKind: saved?.lastMainKind ?? null,
     });
   }
 
