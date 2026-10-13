@@ -28,6 +28,7 @@ import {
 import { ChunkWriter, atomicWriteJson } from './chunker.js';
 import { type BridgeConfig, loadConfig, loadEnvFile } from './config.js';
 import { readControlled } from './control.js';
+import { isProcessAlive } from './control.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
 import { RelaySync } from './sync.js';
 import {
@@ -108,9 +109,11 @@ export class Bridge {
   }
 
   async start(): Promise<void> {
-    this.#running = true;
     await mkdir(this.#config.outDir, { recursive: true });
     await mkdir(this.#config.stateDir, { recursive: true });
+    await this.#acquireLock();
+
+    this.#running = true;
     await this.#loadPersisted();
 
     await this.#rescan();
@@ -296,6 +299,46 @@ export class Bridge {
     this.#relayDirty = true;
   }
 
+  /**
+   * Refuse to run alongside another bridge.
+   *
+   * Two bridges share one state directory and one clone. They would race on the
+   * working tree, on the tail offsets, and on the same git index — and the
+   * failures are confusing rather than obvious, an EEXIST during a copy being
+   * the friendly version. A leftover process is easy to create by accident
+   * since killing a shell does not necessarily kill the node child it spawned.
+   *
+   * A lock file rather than a real lock: the only thing that matters is catching
+   * the common case, and a stale file is detected by checking whether its
+   * process still exists.
+   */
+  async #acquireLock(): Promise<void> {
+    const path = join(this.#config.stateDir, 'bridge.lock');
+
+    try {
+      const raw = await readFile(path, 'utf8');
+      const pid = (JSON.parse(raw) as { pid?: number }).pid;
+      if (typeof pid === 'number' && pid !== process.pid && isProcessAlive(pid)) {
+        throw new Error(
+          `another bridge is already running (pid ${pid}). Stop it first, or delete ${path} if it is stale.`,
+        );
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // No lock is the normal case; an unreadable one is taken over, since a
+      // corrupt file must not be able to prevent the bridge from starting.
+      if (code !== 'ENOENT' && !(error instanceof SyntaxError)) {
+        if (error instanceof Error && error.message.startsWith('another bridge')) throw error;
+      }
+    }
+
+    await writeFile(path, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+  }
+
+  async #releaseLock(): Promise<void> {
+    await rm(join(this.#config.stateDir, 'bridge.lock'), { force: true }).catch(() => {});
+  }
+
   async stop(): Promise<void> {
     this.#running = false;
     for (const timer of this.#timers) clearInterval(timer);
@@ -307,6 +350,7 @@ export class Bridge {
       await this.#writeHead(runtime).catch(() => {});
     }
     await this.#persist();
+    await this.#releaseLock();
   }
 
   // -------------------------------------------------------------------------
