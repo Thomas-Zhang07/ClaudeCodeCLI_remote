@@ -104,17 +104,34 @@ the tail alone is guesswork; the reliable detector is a `PreToolUse`/
 
 ## Open — surfaced by the phone build
 
-### 9. The tree listing grows without bound — biggest scaling risk
+### 9. ~~The tree listing grows without bound~~ — RESOLVED
 
-Change detection polls the branch ref, then fetches `git/trees/relay-out?recursive=1`.
-Because publishing amends and force-pushes whenever events arrive, the head SHA
-moves often — so a "1 request per poll" steady state is really 1 ref request
-*plus* 1 tree request per poll, and **the tree payload grows with every session's
-entire history**, since every sealed chunk is a blob entry forever.
+The phone discovered files with `git/trees/relay-out?recursive=1`, whose payload
+grew with total history and cost two API requests per poll.
 
-The phone cannot prune; this needs chunk retention/archival on the PC side.
+**Resolved** by removing tree listing entirely. Discovery is now two small files —
+`out/index.json` for the session list and `out/sessions/<id>/head.json` for an
+open session — and chunks are fetched by number from a `chunkFirst..chunkLast`
+range. A range is O(1) however much history exists, which is exactly what a
+listing could not be. Retention (rolling ~10 MB per session, oldest chunk
+deleted) bounds the relay itself. See `docs/RELAY-DESIGN.md`.
 
-**Status:** not implemented. This is the item most likely to bite first.
+### 15. Publishing on turn boundaries means no live streaming
+
+A deliberate trade, chosen knowingly: reaching 10 s freshness over git push
+requires ~8,600 pushes a day, which both abuses the provider and blows the free
+storage tier. Streaming prose now arrives in batches at turn boundaries.
+
+**Accepted, not a defect.** Recorded so it is not later mistaken for one.
+
+### 16. Session data can be pruned while the phone is asleep
+
+Retention deletes chunks the phone may be holding an index into. A phone that
+slept through heavy activity can find `chunkFirst` has advanced past what it had.
+The UI must present this as "history not retained" rather than as a gap, and the
+reader must not treat a pruned chunk as an error.
+
+**Status:** handled in the contract, being implemented in the phone.
 
 ### 10. A skewed phone clock makes prompts fail silently
 

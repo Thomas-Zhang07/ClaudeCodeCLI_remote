@@ -28,13 +28,14 @@ PC                                                                     Gitee (pr
 │  ccr ── node-pty ──▶ claude  (TUI preserved;           │        │  relay-out (rewritten)  │
 │                     stdin owned ⇒ prompts injectable)  │ push ▶ │  out/index.json         │
 │                                                        │        │  out/sessions/<id>/     │
-│  bridge                                                │        │    state.json           │
-│    registry ─ sessions/<pid>.json  (liveness, status)  │ ◀ poll │    events-NNNN.jsonl    │
-│    tail     ─ streaming, byte offset, per-file         │        │    subagents.json       │
-│    state    ─ last-wins types → state.json             │        ├─────────────────────────┤
-│    events   ─ chat text + edits + subagent metadata    │        │  relay-in (append-only) │
-│    sync     ─ chunk writer, amended push, backoff      │        │  in/<id>/<ts>.json      │
-│    inbound  ─ fetch → verify HMAC → inject or reject   │        └─────────────────────────┘
+│  bridge                                                │        │    head.json  (chunk    │
+│    registry ─ sessions/<pid>.json  (liveness, status)  │ ◀ poll │                range)  │
+│    tail     ─ streaming, byte offset, per-file         │        │    events-NNNN.jsonl    │
+│    state    ─ last-wins types → head.json              │        │    subagents.json       │
+│    events   ─ chat text + edits + subagent metadata    │        ├─────────────────────────┤
+│    sync     ─ chunk writer, amended push, backoff      │        │  relay-in (append-only) │
+│    inbound  ─ fetch → verify HMAC → inject or reject   │        │  in/<id>/<ts>.json      │
+│    retention─ rolling ~10MB per session, oldest deleted│        └─────────────────────────┘
 │                                                        │                   ▲   │
 └────────────────────────────────────────────────────────┘       Contents API  │   │ PUT
                                                                   (CORS ✓)     │   ▼

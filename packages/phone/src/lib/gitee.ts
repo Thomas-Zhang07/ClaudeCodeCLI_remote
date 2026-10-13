@@ -12,13 +12,12 @@
  *    `GET /api/v5/rate_limit` is a 404. So the client cannot budget requests; it
  *    can only react to a 429/403 by backing off.
  *  - **Conditional requests are pointless.** A 304 still costs quota, so
- *    `If-None-Match` buys nothing. The cheap way to avoid work is to poll the
- *    branch ref (one request) and stop when the head commit has not moved.
+ *    `If-None-Match` buys nothing — there is no cheap way to ask "has anything
+ *    changed?". The client therefore keeps its inquiries small and — where it
+ *    can — bounded: one tiny JSON file per poll, and chunks only by number.
  */
 
 import { reactive } from 'vue';
-
-import type { TreeEntry } from '@/types';
 
 import { decodeBase64Text } from './encoding';
 
@@ -62,13 +61,6 @@ export interface RelayTarget {
   token: string;
 }
 
-export interface TreeResult {
-  entries: TreeEntry[];
-  truncated: boolean;
-  /** How many pages were needed; > 1 means the tree was paginated. */
-  pages: number;
-}
-
 export interface FileResult {
   path: string;
   sha: string;
@@ -82,8 +74,6 @@ const MAX_BACKOFF_MS = 120_000;
 const BASE_BACKOFF_MS = 15_000;
 /** A hung request on a phone has to be abandoned rather than waited on. */
 const REQUEST_TIMEOUT_MS = 25_000;
-const MAX_TREE_PAGES = 6;
-const TREE_PAGE_SIZE = 1000;
 
 export const throttle = reactive<ThrottleState>({
   active: false,
@@ -255,57 +245,13 @@ export class GiteeClient {
   }
 
   /**
-   * The head commit of a branch — the one cheap request per poll.
+   * Read one file. Returns null when the path is absent (404).
    *
-   * Returns null when the branch does not exist yet, which is the normal state
-   * of a relay that has never been published to.
+   * A 404 is deliberately not an error here: readers use it as a signal. A
+   * chunk 404 means Gitee's Contents API has not caught up with the branch ref
+   * yet, and a missing `index.json` means nothing has been published — neither
+   * is a failure worth surfacing.
    */
-  async branchHead(branch: string): Promise<string | null> {
-    type BranchInfo = { commit?: { sha?: string } };
-    try {
-      const info = await this.#json<BranchInfo>(
-        this.#url(`/branches/${encodeURIComponent(branch)}`),
-        { headers: this.#headers() },
-        `branch ${branch}`,
-      );
-      return info.commit?.sha ?? null;
-    } catch (error) {
-      if (error instanceof GiteeError && error.failure === 'not-found') return null;
-      throw error;
-    }
-  }
-
-  /**
-   * List the tree recursively.
-   *
-   * Gitee caps a response and sets `truncated`; we page a bounded number of
-   * times and report the flag so the UI can warn rather than silently showing
-   * half of the sessions.
-   */
-  async tree(ref: string): Promise<TreeResult> {
-    type TreeResponse = { tree?: TreeEntry[]; truncated?: boolean };
-    const byPath = new Map<string, TreeEntry>();
-    let truncated = false;
-    let pages = 0;
-
-    for (let page = 1; page <= MAX_TREE_PAGES; page++) {
-      const url = `${this.#url(`/git/trees/${encodeURIComponent(ref)}`)}?recursive=1&per_page=${TREE_PAGE_SIZE}&page=${page}`;
-      const data = await this.#json<TreeResponse>(url, { headers: this.#headers() }, `tree ${ref}`);
-      pages = page;
-
-      for (const entry of data.tree ?? []) {
-        if (entry && typeof entry.path === 'string') byPath.set(entry.path, entry);
-      }
-
-      truncated = data.truncated === true;
-      if (!truncated) break;
-      if ((data.tree ?? []).length === 0) break;
-    }
-
-    return { entries: [...byPath.values()], truncated, pages };
-  }
-
-  /** Read one file. Returns null when the path is absent (404). */
   async readFile(path: string, ref: string): Promise<FileResult | null> {
     type ContentsResponse = {
       path?: string;

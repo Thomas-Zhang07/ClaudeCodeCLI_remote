@@ -1,10 +1,14 @@
 /**
- * Blob cache, keyed by repository path.
+ * Chunk cache, keyed by repository path.
  *
- * The relay's tree endpoint gives a sha per blob; comparing that against what we
- * already hold is what turns a revisit into zero content requests. Entries are
- * written to localStorage so reopening the PWA paints from the last known state
- * instead of from an empty screen.
+ * It now holds only sealed event chunks, and that makes caching simple: a chunk
+ * is immutable once written, so a cached chunk is never stale and never needs
+ * revalidating. Its path alone is the key — the sha argument exists for callers
+ * that do have one (and pass `''` when they do not). Not fetching a chunk we
+ * already hold is the whole point of the numbered-chunk layout.
+ *
+ * Entries are written to localStorage so reopening the PWA paints from the last
+ * known state instead of from an empty screen.
  *
  * The cache is best-effort by design: it is bounded, evictable, and every access
  * is guarded, because localStorage throws in private mode and runs out of quota
@@ -23,20 +27,14 @@ interface CacheEntry {
 const KEY = 'ccr.blobcache.v2';
 const MAX_BYTES = 3_000_000;
 const MAX_ENTRIES = 500;
-/** Nothing this large is worth keeping around; chunks above it are re-fetchable. */
+/**
+ * Nothing this large is worth keeping around.
+ *
+ * The bridge caps a chunk at 256 KiB, so a normal chunk fits comfortably; this
+ * bounds the odd oversized one, which is always re-fetchable.
+ */
 const MAX_ENTRY_CHARS = 400_000;
 const WRITE_DEBOUNCE_MS = 900;
-
-/** Small, always-useful files: never evicted while a session is being read. */
-function isPinned(path: string): boolean {
-  return (
-    path.endsWith('/index.json') ||
-    path.endsWith('/state.json') ||
-    path.endsWith('/manifest.json') ||
-    path.endsWith('/subagents.json') ||
-    path === 'out/index.json'
-  );
-}
 
 function isValidEntry(value: unknown): value is CacheEntry {
   if (value === null || typeof value !== 'object') return false;
@@ -175,9 +173,9 @@ export class BlobCache {
   #evict(targetBytes = MAX_BYTES): void {
     if (this.#bytes <= targetBytes && this.#entries.size <= MAX_ENTRIES) return;
 
-    const evictable = [...this.#entries.entries()]
-      .filter(([path]) => !isPinned(path))
-      .sort((a, b) => a[1].at - b[1].at);
+    // Every entry is an immutable chunk, so all of them are equally evictable;
+    // the least recently read goes first.
+    const evictable = [...this.#entries.entries()].sort((a, b) => a[1].at - b[1].at);
 
     for (const [path, entry] of evictable) {
       if (this.#bytes <= targetBytes * 0.8 && this.#entries.size <= MAX_ENTRIES) break;

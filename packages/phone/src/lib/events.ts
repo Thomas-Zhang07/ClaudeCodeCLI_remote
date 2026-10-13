@@ -1,30 +1,36 @@
 /**
  * Chunk parsing and stream assembly.
  *
- * Two integrity rules from the writer shape everything here:
+ * There is no manifest on the wire any more. Chunks are immutable, numbered and
+ * contiguous, so the reader already knows a chunk's expected number, and the
+ * terminating `{"t":"chunk_end"}` sentinel carries everything else it needs:
  *
- *  - Every sealed chunk ends with a `{"t":"chunk_end"}` sentinel. Its absence
- *    means the chunk is still being written (or was torn by a crash), so it is
- *    discarded and refetched rather than half-believed.
- *  - `manifest.json` records a sequence range per chunk. The ranges must join up
- *    (`lastSeq[n] + 1 === firstSeq[n + 1]`); a break means events were lost, and
- *    the reader resyncs from the last good chunk instead of rendering a timeline
- *    with a silent hole in it.
+ *  - **A missing sentinel means the chunk is not sealed yet.** The writer is
+ *    still appending, so the chunk is discarded and refetched on a later poll —
+ *    never half-believed. This is the normal state of the newest chunk while a
+ *    turn is streaming, so it is not treated as an error.
+ *  - **The sentinel's `crc32` covers `${firstSeq}:${lines}`** for the chunk it
+ *    terminates. Computing that from the parsed body checks the body and the
+ *    sentinel agree, which catches a truncated or duplicated chunk without any
+ *    out-of-band digest.
+ *
+ * Sequence continuity is checked across chunks as before: a chunk whose events
+ * do not continue the previous chunk's sequence is a real break, and everything
+ * after it is withheld rather than rendered out of order.
  */
 
-import type { ChunkEndSentinel, ChunkEntry, NormalizedEvent } from '@/types';
+import type { ChunkEndSentinel, NormalizedEvent } from '@/types';
 
-import { crc32, sha256Hex, utf8Bytes } from './encoding';
+import { crc32, utf8Bytes } from './encoding';
 
 export type ChunkRejection =
   | 'ok'
+  | 'incomplete'
   | 'empty'
-  | 'no-sentinel'
   | 'torn-line'
   | 'trailing-after-sentinel'
   | 'line-count-mismatch'
   | 'chunk-number-mismatch'
-  | 'seq-mismatch'
   | 'checksum-mismatch';
 
 export interface ChunkParse {
@@ -32,6 +38,11 @@ export interface ChunkParse {
   events: NormalizedEvent[];
   sentinel: ChunkEndSentinel | null;
   reason: ChunkRejection;
+  /**
+   * True when the chunk has no sentinel: the writer has not sealed it yet.
+   * Callers must treat this as "not ready", never as a gap or a corruption.
+   */
+  incomplete: boolean;
 }
 
 function isSentinel(value: unknown): value is ChunkEndSentinel {
@@ -49,13 +60,15 @@ function isEventLike(value: unknown): value is NormalizedEvent {
 /**
  * Parse one chunk file.
  *
- * `entry` is the manifest record when there is one; passing it turns on the
- * checks the manifest makes possible (line count, sequence range, CRC-32).
+ * `expectedN` is the number the reader asked for. Passing it checks the sentinel
+ * against the request, which catches a mis-numbered file that would otherwise
+ * assemble into the stream at the wrong position.
  */
-export function parseChunk(text: string, entry?: ChunkEntry): ChunkParse {
+export function parseChunk(text: string, expectedN?: number): ChunkParse {
   const lines = text.split('\n');
   const events: NormalizedEvent[] = [];
   let sentinel: ChunkEndSentinel | null = null;
+  let torn = false;
   let trailing = false;
 
   for (const raw of lines) {
@@ -66,8 +79,8 @@ export function parseChunk(text: string, entry?: ChunkEntry): ChunkParse {
     try {
       parsed = JSON.parse(line);
     } catch {
-      // A partial line only ever comes from a chunk the writer had not sealed.
-      return { ok: false, events, sentinel, reason: 'torn-line' };
+      torn = true;
+      continue;
     }
 
     if (isSentinel(parsed)) {
@@ -82,48 +95,43 @@ export function parseChunk(text: string, entry?: ChunkEntry): ChunkParse {
     if (isEventLike(parsed)) events.push(parsed);
   }
 
-  if (trailing) return { ok: false, events: [], sentinel, reason: 'trailing-after-sentinel' };
-  if (sentinel === null) return { ok: false, events: [], sentinel: null, reason: 'no-sentinel' };
-  if (events.length === 0) return { ok: false, events: [], sentinel, reason: 'empty' };
-
-  if (entry) {
-    if (sentinel.n !== entry.n) {
-      return { ok: false, events: [], sentinel, reason: 'chunk-number-mismatch' };
-    }
-    if (sentinel.lines !== events.length || entry.lines !== events.length) {
-      return { ok: false, events: [], sentinel, reason: 'line-count-mismatch' };
-    }
-    const first = events[0]!.seq;
-    const last = events[events.length - 1]!.seq;
-    if (first !== entry.firstSeq || last !== entry.lastSeq) {
-      return { ok: false, events: [], sentinel, reason: 'seq-mismatch' };
-    }
-    // The sentinel's CRC covers the manifest's own claim about the chunk, so it
-    // detects a manifest and a chunk that disagree.
-    const expected = crc32(utf8Bytes(`${entry.firstSeq}:${entry.lastSeq}:${entry.lines}`));
-    if (expected !== sentinel.crc32) {
-      return { ok: false, events: [], sentinel, reason: 'checksum-mismatch' };
-    }
+  if (sentinel === null) {
+    // Unsealed. A torn final line is expected here — the writer may be mid-line
+    // as we read — so this takes precedence over the torn-line verdict below.
+    return { ok: false, events: [], sentinel: null, reason: 'incomplete', incomplete: true };
   }
 
-  return { ok: true, events, sentinel, reason: 'ok' };
+  if (torn) return { ok: false, events: [], sentinel, reason: 'torn-line', incomplete: false };
+  if (trailing) {
+    return { ok: false, events: [], sentinel, reason: 'trailing-after-sentinel', incomplete: false };
+  }
+  if (events.length === 0) return { ok: false, events: [], sentinel, reason: 'empty', incomplete: false };
+
+  if (expectedN !== undefined && sentinel.n !== expectedN) {
+    return { ok: false, events: [], sentinel, reason: 'chunk-number-mismatch', incomplete: false };
+  }
+  if (sentinel.lines !== events.length) {
+    return { ok: false, events: [], sentinel, reason: 'line-count-mismatch', incomplete: false };
+  }
+
+  // The writer seals over the chunk's own first sequence and line count; both
+  // come from the body we just parsed, so this is checkable without a manifest.
+  const expected = crc32(utf8Bytes(`${events[0]!.seq}:${sentinel.lines}`));
+  if (expected !== sentinel.crc32) {
+    return { ok: false, events: [], sentinel, reason: 'checksum-mismatch', incomplete: false };
+  }
+
+  return { ok: true, events, sentinel, reason: 'ok', incomplete: false };
 }
 
 /**
- * Verify a chunk's SHA-256 against the manifest.
+ * One chunk, ready to assemble.
  *
- * Returns null when the digest cannot be checked (no Web Crypto, i.e. an
- * insecure origin): unverifiable is not the same as verified, so callers must
- * not treat null as a pass or a failure.
+ * `n` replaces the old manifest record: it is all the reader knows about the
+ * chunk, and it is enough, because the events carry their own sequences.
  */
-export async function verifyChunkDigest(text: string, entry: ChunkEntry): Promise<boolean | null> {
-  const digest = await sha256Hex(utf8Bytes(text));
-  if (digest === null) return null;
-  return digest === entry.sha256;
-}
-
 export interface LoadedChunk {
-  entry: ChunkEntry;
+  n: number;
   events: NormalizedEvent[];
 }
 
@@ -142,10 +150,10 @@ export interface Assembled {
  * Concatenate chunks, dropping anything that does not continue the sequence.
  *
  * Chunks are sorted by their `n`, not trusted in the order they arrived: with
- * parallel fetches the arrival order means nothing.
+ * parallel or caught-up fetches the arrival order means nothing.
  */
 export function assembleStream(chunks: readonly LoadedChunk[]): Assembled {
-  const ordered = [...chunks].sort((a, b) => a.entry.n - b.entry.n);
+  const ordered = [...chunks].sort((a, b) => a.n - b.n);
 
   const events: NormalizedEvent[] = [];
   let duplicatesDropped = 0;
@@ -175,34 +183,6 @@ export function assembleStream(chunks: readonly LoadedChunk[]): Assembled {
     truncatedAtGap: gapAfterSeq !== null,
     lastSeq,
   };
-}
-
-/**
- * The first chunk that does not follow the previous one, if any.
- *
- * Runs against the manifest alone, so a break is detected before spending any
- * requests on content we would have to throw away.
- */
-export function findManifestBreak(entries: readonly ChunkEntry[]): ChunkEntry | null {
-  const ordered = [...entries].sort((a, b) => a.n - b.n);
-  for (let i = 1; i < ordered.length; i++) {
-    const previous = ordered[i - 1]!;
-    const current = ordered[i]!;
-    if (current.firstSeq !== previous.lastSeq + 1) return current;
-  }
-  return null;
-}
-
-/** Chunk numbers that the manifest implies but which are not present. */
-export function findMissingChunks(entries: readonly ChunkEntry[]): number[] {
-  const ordered = [...entries].sort((a, b) => a.n - b.n);
-  const missing: number[] = [];
-  for (let i = 1; i < ordered.length; i++) {
-    const previous = ordered[i - 1]!;
-    const current = ordered[i]!;
-    for (let n = previous.n + 1; n < current.n; n++) missing.push(n);
-  }
-  return missing;
 }
 
 export interface TimelineMeta {

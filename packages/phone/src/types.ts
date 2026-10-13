@@ -42,18 +42,43 @@ export interface CostState {
   >;
 }
 
-export interface SessionState {
+/**
+ * The per-session file polled while that session is open.
+ *
+ * It carries the chunk range as well as the state, which is what lets the
+ * reader work without a file listing: chunks are immutable and numbered, so
+ * knowing which numbers exist is enough to fetch whatever is missing. It is
+ * deliberately tiny — one of these is fetched on every poll.
+ */
+export interface SessionHead {
   sessionId: string;
   project: string | null;
   title: string | null;
   status: SessionStatus;
+  /** Set only while `status` is `waiting`; the reason the session needs you. */
   waitingFor: string | null;
   model: string | null;
   gitBranch: string | null;
   controllable: boolean;
   cost?: CostState;
-  chunkLast?: number;
   updatedAt: string;
+  /** Lowest chunk number still retained. Above 1 means history was pruned. */
+  chunkFirst: number;
+  /**
+   * Highest chunk number that contains events.
+   *
+   * `chunkLast < chunkFirst` means the session has recorded nothing yet, so the
+   * reader must fetch nothing rather than request a chunk that does not exist.
+   */
+  chunkLast: number;
+  /** Lowest retained event sequence. */
+  firstSeq: number;
+  /** Highest event sequence written. */
+  lastSeq: number;
+  /** Bytes currently retained for this session. */
+  retainedBytes: number;
+  /** Events dropped by rolling retention, so the reader can say so plainly. */
+  droppedEvents: number;
 }
 
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'stopped';
@@ -74,21 +99,16 @@ export interface SubagentNode {
   children: SubagentNode[];
 }
 
-export interface ChunkEntry {
-  n: number;
-  sha256: string;
-  bytes: number;
-  firstSeq: number;
-  lastSeq: number;
-  lines: number;
-}
-
-export interface ChunkManifest {
-  sessionId: string;
-  chunks: ChunkEntry[];
-}
-
-/** Terminating line of every chunk. Its absence means the chunk is torn. */
+/**
+ * Terminating line of every chunk.
+ *
+ * Its absence means the chunk has not been sealed — the writer is still
+ * appending to it, so it is discarded and refetched later rather than
+ * half-believed. Its presence is also the reader's only integrity anchor now
+ * that no manifest exists: `crc32` covers `${firstSeq}:${lines}` for the chunk
+ * it terminates, which lets the reader check the body against the sentinel
+ * without knowing anything the writer did not publish.
+ */
 export interface ChunkEndSentinel {
   t: 'chunk_end';
   n: number;
@@ -219,12 +239,4 @@ export interface OutboundPrompt {
   /** Set once an `injection` event carrying this promptId appears in the stream. */
   acknowledged?: InjectionState;
   ackDetail?: string;
-}
-
-/** The raw shape of a trees/blob listing entry. */
-export interface TreeEntry {
-  path: string;
-  type: 'blob' | 'tree' | string;
-  sha: string;
-  size?: number;
 }
