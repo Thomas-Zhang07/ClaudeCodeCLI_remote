@@ -33,13 +33,34 @@ export const POLL_MAX_MS = 60_000;
 
 const KEY = 'ccr.settings.v1';
 
+/**
+ * Build-time defaults for the fields that are not secret.
+ *
+ * Owner, repository and cadence are not credentials, so pre-filling them from
+ * the repository's `.env` saves typing without exposing anything.
+ *
+ * The token and the secret are deliberately **not** given defaults and must
+ * never be added here. They are served from a public URL, so anything baked into
+ * this bundle is readable by anyone who opens the page — and the token reads
+ * every relayed session and can write prompts into the PC.
+ */
+const BUILD_DEFAULTS = {
+  owner: import.meta.env.VITE_CCR_OWNER ?? '',
+  repo: import.meta.env.VITE_CCR_REPO ?? '',
+  pollMs: Number.parseInt(import.meta.env.VITE_CCR_POLL_MS ?? '', 10),
+} as const;
+
 const DEFAULTS: Settings = {
-  owner: '',
-  repo: '',
+  owner: BUILD_DEFAULTS.owner,
+  repo: BUILD_DEFAULTS.repo,
   token: '',
   secret: '',
-  pollMs: 15_000,
+  pollMs: Number.isFinite(BUILD_DEFAULTS.pollMs) ? BUILD_DEFAULTS.pollMs : 15_000,
 };
+
+function nonEmpty(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
 
 function clampPoll(ms: number): number {
   if (!Number.isFinite(ms)) return DEFAULTS.pollMs;
@@ -49,8 +70,13 @@ function clampPoll(ms: number): number {
 function load(): Settings {
   const raw = getJSON<Partial<Settings>>(KEY, {});
   return {
-    owner: typeof raw.owner === 'string' ? raw.owner : '',
-    repo: typeof raw.repo === 'string' ? raw.repo : '',
+    // An empty stored value falls back to the build default rather than
+    // winning. Anyone who opened Settings before the defaults existed has `''`
+    // saved, and treating that as a deliberate choice would silently defeat the
+    // pre-fill for exactly the people it was added for. These two fields are
+    // never meaningfully empty — the app cannot work without them.
+    owner: nonEmpty(raw.owner) ?? DEFAULTS.owner,
+    repo: nonEmpty(raw.repo) ?? DEFAULTS.repo,
     token: typeof raw.token === 'string' ? raw.token : '',
     secret: typeof raw.secret === 'string' ? raw.secret : '',
     pollMs: clampPoll(typeof raw.pollMs === 'number' ? raw.pollMs : DEFAULTS.pollMs),

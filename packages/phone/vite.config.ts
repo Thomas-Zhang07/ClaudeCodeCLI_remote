@@ -10,6 +10,17 @@ export default defineConfig({
   // Relative base so the build also works when served from a sub-path (e.g.
   // Gitee Pages project sites live at /<owner>/<repo>/).
   base: './',
+  // Read `.env` from the repository root, where the PC's configuration already
+  // lives, so the non-secret defaults below have a single source of truth.
+  //
+  // Only `VITE_*` variables reach the bundle, and only owner, repository and
+  // poll interval are defined as `VITE_*` — the token and the signing secret are
+  // deliberately absent. This build is served from a public URL, so anything
+  // baked in is readable by anyone who loads the page, and the token reads every
+  // session and can write prompts to the PC.
+  // `packages/phone/` → `..` is `packages/` → `../..` is the repository root,
+  // which is where the PC's `.env` actually lives.
+  envDir: fileURLToPath(new URL('../..', import.meta.url)),
   plugins: [
     vue(),
     VitePWA({
