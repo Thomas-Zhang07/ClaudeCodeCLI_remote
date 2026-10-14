@@ -58,6 +58,7 @@ import {
   scanProjects,
   type DiscoveredSession,
 } from './discovery.js';
+import { lockAgeMs, lockIsLive, lockPath, readLock } from './lock.js';
 import { SerialQueue } from './queue.js';
 import { advanceLastMainKind, resumeSeq, SessionAggregator } from './session.js';
 import { Tailer, type TailState } from './tailer.js';
@@ -705,29 +706,29 @@ export class Bridge {
    * which detects a live writer no matter who started it.
    *
    * The pid is kept for the error message only; it is not trusted.
+   *
+   * The rules themselves live in `lock.ts`, because `ccr` starts a bridge and so
+   * has to reach the same verdict — see there for why agreement matters.
    */
   async #acquireLock(): Promise<void> {
-    const path = this.#lockPath();
+    const path = lockPath(this.#config.stateDir);
+    const lock = await readLock(this.#config.stateDir);
+    const age = lockAgeMs(lock, Date.now());
 
-    try {
-      const raw = JSON.parse(await readFile(path, 'utf8')) as { pid?: number; heartbeat?: number };
-      const age = Date.now() - (raw.heartbeat ?? 0);
-
-      if (age < this.#config.lockStaleMs) {
-        throw new Error(
-          `another bridge is already running (pid ${raw.pid ?? 'unknown'}, last seen ${Math.round(age / 1000)}s ago). ` +
-            `Stop it first, or delete ${path} if you are certain it is gone.`,
-        );
-      }
-
-      process.stderr.write(
-        `[bridge] taking over a lock last refreshed ${Math.round(age / 1000)}s ago (pid ${raw.pid ?? 'unknown'})\n`,
+    if (lock !== null && lockIsLive(lock, this.#config.lockStaleMs)) {
+      throw new Error(
+        `another bridge is already running (pid ${lock.pid ?? 'unknown'}, last seen ${Math.round(age / 1000)}s ago). ` +
+          `Stop it first, or delete ${path} if you are certain it is gone.`,
       );
-    } catch (error) {
-      // No lock is the normal case. An unreadable one is taken over, since a
-      // corrupt file must not be able to prevent the bridge from starting —
-      // but our own refusal must not be swallowed by this catch.
-      if (error instanceof Error && error.message.startsWith('another bridge')) throw error;
+    }
+
+    if (lock !== null) {
+      // `Infinity` is how a lock with no readable timestamp reads; saying
+      // "Infinity seconds ago" is worse than saying nothing.
+      const seen = Number.isFinite(age) ? `${Math.round(age / 1000)}s ago` : 'never';
+      process.stderr.write(
+        `[bridge] taking over a lock last refreshed ${seen} (pid ${lock.pid ?? 'unknown'})\n`,
+      );
     }
 
     await this.#writeLock();
@@ -741,17 +742,13 @@ export class Bridge {
 
   async #writeLock(): Promise<void> {
     await writeFile(
-      this.#lockPath(),
+      lockPath(this.#config.stateDir),
       JSON.stringify({ pid: process.pid, heartbeat: Date.now(), startedAt: new Date().toISOString() }),
     );
   }
 
-  #lockPath(): string {
-    return join(this.#config.stateDir, 'bridge.lock');
-  }
-
   async #releaseLock(): Promise<void> {
-    await rm(this.#lockPath(), { force: true }).catch(() => {});
+    await rm(lockPath(this.#config.stateDir), { force: true }).catch(() => {});
   }
 
   async stop(): Promise<void> {

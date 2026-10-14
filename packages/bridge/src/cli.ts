@@ -12,12 +12,22 @@
  *   2. registers itself, which is how the bridge learns a session is
  *      controllable rather than merely observable
  *   3. listens on a named pipe for prompts the bridge wants delivered
+ *
+ * And, since a controllable session with no bridge behind it is watched by
+ * nobody and reachable from nowhere — while looking exactly like a working one
+ * — it starts a bridge if there is not one, and stops the one it started when
+ * the session ends. See `ensureBridge`.
  */
 
-import { mkdir } from 'node:fs/promises';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { closeSync, openSync } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   controlPipePath,
+  readControlled,
   registerControlled,
   startControlServer,
   unregisterControlled,
@@ -26,6 +36,7 @@ import {
 } from './control.js';
 import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { injectPrompt } from './inject.js';
+import { lockIsLive, lockPath, readLock } from './lock.js';
 import { attachTerminal, PtySession, resolveExecutable } from './pty.js';
 
 export interface CcrOptions {
@@ -57,6 +68,163 @@ export interface CcrRuntime {
 }
 
 /**
+ * Where a bridge started by `ccr` writes its output.
+ *
+ * A bridge started from a shell inherits that terminal and needs no file. One
+ * started by `ccr` has nowhere to go: the terminal is about to be taken over by
+ * Claude Code's interface, and a line printed into it mid-render corrupts the
+ * display. So it goes to a file under the state directory, which is already
+ * gitignored and is where the rest of the runtime state lives.
+ */
+export function bridgeLogPath(stateDir: string): string {
+  return join(stateDir, 'logs', 'bridge.log');
+}
+
+/** The bridge entry point, which sits beside this file once built. */
+function bridgeEntry(): string {
+  return fileURLToPath(new URL('./index.js', import.meta.url));
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Wait for the bridge to take the lock.
+ *
+ * It acquires the lock in the first moments of `start()`, before it scans
+ * anything, so this normally returns in well under the timeout. Running the
+ * whole timeout out means it never got that far — worth one line, because it is
+ * said while there is still a screen to say it on, and the alternative is a
+ * session that looks healthy and is watched by nobody.
+ */
+async function waitForLock(
+  stateDir: string,
+  pid: number | undefined,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const lock = await readLock(stateDir);
+    if (lock !== null && (pid === undefined || lock.pid === pid)) return true;
+    if (Date.now() >= deadline) return false;
+    await delay(100);
+  }
+}
+
+/** Wait for a child to exit, reporting whether it did so within the timeout. */
+function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Start a bridge, unless one is already running.
+ *
+ * Requiring a bridge to be started separately meant two things to remember and
+ * an easy way to end up with a controllable session that is neither watched nor
+ * reachable from the phone — indistinguishable, from the terminal, from one that
+ * is working.
+ *
+ * @returns the process this call started, or null when a bridge was already
+ *   running. **Only ever the process this call started is stopped again**: one
+ *   that was already up belongs to whoever started it, very possibly the user
+ *   from a shell they are still watching.
+ */
+export async function ensureBridge(
+  config: BridgeConfig,
+  log: (message: string) => void,
+): Promise<ChildProcess | null> {
+  const lock = await readLock(config.stateDir);
+
+  // The same rule the bridge applies to itself — see `lock.ts` for why the two
+  // must agree rather than each deciding separately.
+  if (lockIsLive(lock, config.lockStaleMs)) {
+    log(`bridge already running (pid ${lock?.pid ?? 'unknown'})`);
+    return null;
+  }
+
+  if (lock !== null) log('the bridge lock on record is stale; starting a bridge');
+
+  const logFile = bridgeLogPath(config.stateDir);
+  await mkdir(dirname(logFile), { recursive: true });
+
+  // Opened rather than inherited, so nothing the bridge prints can land in the
+  // middle of Claude Code's display.
+  const fd = openSync(logFile, 'a');
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, [bridgeEntry()], {
+      stdio: ['ignore', fd, fd],
+      windowsHide: true,
+    });
+  } finally {
+    // The child holds its own descriptor; closing ours cannot cut the log short.
+    closeSync(fd);
+  }
+
+  const pid = child.pid;
+  child.on('error', (error) => log(`could not start the bridge: ${String(error)}`));
+
+  if (await waitForLock(config.stateDir, pid, 1_500)) {
+    log(`bridge started (pid ${pid ?? 'unknown'}), logging to ${logFile}`);
+  } else {
+    log(`the bridge did not come up; see ${logFile}`);
+  }
+
+  return child;
+}
+
+/**
+ * Stop the bridge this session started, unless another session still needs it.
+ *
+ * The other-session check exists because two `ccr` sessions share one bridge: the
+ * second finds the first's lock and starts nothing of its own, so without this
+ * check the first to exit would take the bridge down underneath the session that
+ * is still running.
+ */
+async function stopOwnedBridge(
+  child: ChildProcess | null,
+  config: BridgeConfig,
+  log: (message: string) => void,
+): Promise<void> {
+  const pid = child?.pid;
+  if (child === null || pid === undefined) return;
+
+  const others = (await readControlled(config.stateDir)).filter(
+    (session) => session.pid !== process.pid,
+  );
+  if (others.length > 0) {
+    log(`leaving the bridge running: ${others.length} other ccr session(s) still open`);
+    return;
+  }
+
+  child.kill();
+
+  // Windows has no signals, so `kill` terminates the process outright and the
+  // bridge's own shutdown never runs: its lock is left behind, and the next
+  // `ccr` would read that as a live bridge within `lockStaleMs` and decline to
+  // start one — leaving a session nobody is watching, which is the whole thing
+  // this is here to prevent. So the lock goes when the process does.
+  //
+  // Nothing is lost by the abrupt exit: an unsealed chunk is recovered from the
+  // file on the next open, which is the same path a crash takes.
+  if (!(await waitForExit(child, 3_000))) {
+    log(`the bridge (pid ${pid}) has not exited; it will be taken over once its lock goes stale`);
+  }
+
+  const lock = await readLock(config.stateDir);
+  if (lock?.pid === pid) await rm(lockPath(config.stateDir), { force: true }).catch(() => {});
+}
+
+/**
  * Run a controllable session to completion.
  *
  * Returns the child's exit code so the shell sees what Claude Code exited with,
@@ -69,53 +237,75 @@ export async function runCcr(
 ): Promise<number> {
   await mkdir(config.stateDir, { recursive: true });
 
-  const session = new PtySession({
-    // Resolved before spawning: ConPTY cannot find a bare command name.
-    command: resolveExecutable(options.command),
-    args: options.args,
-    cwd: options.cwd,
-    cols: terminal.stdout.columns ?? 120,
-    rows: terminal.stdout.rows ?? 30,
-  });
+  /**
+   * Nothing may be written once Claude Code owns the terminal: a stray line
+   * mid-render corrupts the display. Everything that needs saying is said
+   * before the pty is attached, and again after it is detached.
+   */
+  let quiet = false;
+  const log = (message: string): void => {
+    if (quiet) return;
+    process.stderr.write(`[ccr] ${message}\n`);
+  };
 
-  session.start();
-  const pid = session.pid;
-  if (pid === null) throw new Error('the pty did not start');
+  const bridge = await ensureBridge(config, log);
 
-  const pipe = controlPipePath(pid);
-  const server = await startControlServer(pipe, (message) =>
-    handleControlMessage(message, session, config),
-  );
+  try {
+    const session = new PtySession({
+      // Resolved before spawning: ConPTY cannot find a bare command name.
+      command: resolveExecutable(options.command),
+      args: options.args,
+      cwd: options.cwd,
+      cols: terminal.stdout.columns ?? 120,
+      rows: terminal.stdout.rows ?? 30,
+    });
 
-  await registerControlled(config.stateDir, {
-    pid,
-    // Not known here: the session id is assigned by Claude Code and appears in
-    // its own registry, which the bridge matches on pid.
-    sessionId: null,
-    pipe,
-    cwd: options.cwd,
-    startedAt: new Date().toISOString(),
-  });
+    session.start();
+    const pid = session.pid;
+    if (pid === null) throw new Error('the pty did not start');
 
-  const detach = attachTerminal(session, terminal);
+    const pipe = controlPipePath(pid);
+    const server = await startControlServer(pipe, (message) =>
+      handleControlMessage(message, session, config),
+    );
 
-  const exit = await new Promise<number>((resolve) => {
-    session.onExit(({ exitCode }) => resolve(exitCode));
+    await registerControlled(config.stateDir, {
+      pid,
+      // Not known here: the session id is assigned by Claude Code and appears in
+      // its own registry, which the bridge matches on pid.
+      sessionId: null,
+      pipe,
+      cwd: options.cwd,
+      startedAt: new Date().toISOString(),
+    });
 
-    const stop = (): void => {
-      session.kill();
-    };
-    process.once('SIGTERM', stop);
-    process.once('SIGHUP', stop);
-  });
+    const detach = attachTerminal(session, terminal);
+    quiet = true;
 
-  // Tidy up in an order that cannot leave the bridge talking to a dead pipe, or
-  // a stale registration pointing at a process that no longer exists.
-  detach();
-  await server.close().catch(() => {});
-  await unregisterControlled(config.stateDir, pid).catch(() => {});
+    const exit = await new Promise<number>((resolve) => {
+      session.onExit(({ exitCode }) => resolve(exitCode));
 
-  return exit;
+      const stop = (): void => {
+        session.kill();
+      };
+      process.once('SIGTERM', stop);
+      process.once('SIGHUP', stop);
+    });
+
+    // Tidy up in an order that cannot leave the bridge talking to a dead pipe, or
+    // a stale registration pointing at a process that no longer exists.
+    detach();
+    quiet = false;
+    await server.close().catch(() => {});
+    await unregisterControlled(config.stateDir, pid).catch(() => {});
+
+    return exit;
+  } finally {
+    // Whether the session ended cleanly, threw, or never started at all: the
+    // bridge this call started must not outlive it.
+    quiet = false;
+    await stopOwnedBridge(bridge, config, log);
+  }
 }
 
 /**
