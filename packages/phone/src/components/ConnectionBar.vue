@@ -3,8 +3,9 @@ import { computed, ref } from 'vue';
 
 import { parseTs, relativeTime } from '@/lib/format';
 import { useNow } from '@/lib/now';
+import { reloadApp } from '@/lib/reload';
 import { isConfigured } from '@/lib/settings';
-import { refreshNow, relay, throttledForMs } from '@/stores/relay';
+import { relay, throttledForMs } from '@/stores/relay';
 
 const now = useNow(1000);
 
@@ -15,6 +16,11 @@ const backoffMs = computed(() => throttledForMs(now.value));
  * two on a phone — long enough that a button which looks identical before and
  * after reads as one that does nothing at all, which is what this one used to
  * do and why it was reported as broken.
+ *
+ * It now reloads the app rather than re-reading the relay. Re-reading was the
+ * honest answer to "has anything new happened" and no answer at all to "why am I
+ * still looking at the old version", which is the question someone reaching for
+ * this button on a phone is usually asking. See `lib/reload.ts`.
  */
 const refreshing = ref(false);
 
@@ -22,8 +28,9 @@ async function refresh(): Promise<void> {
   if (refreshing.value) return;
   refreshing.value = true;
   try {
-    await refreshNow();
+    await reloadApp();
   } finally {
+    // Only reached if the reload did not happen.
     refreshing.value = false;
   }
 }
@@ -140,10 +147,11 @@ const detail = computed(() => {
       type="button"
       :disabled="refreshing"
       :aria-busy="refreshing"
+      title="Reload the app, discarding everything cached on this device"
       @click="refresh()"
     >
       <span class="glyph" :class="{ turning: refreshing }" aria-hidden="true">⟳</span>
-      <span class="sr-only">{{ refreshing ? 'Refreshing' : 'Refresh now' }}</span>
+      <span class="sr-only">{{ refreshing ? 'Reloading' : 'Reload the app and clear its cache' }}</span>
     </button>
   </div>
 </template>
