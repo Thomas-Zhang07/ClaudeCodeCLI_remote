@@ -38,6 +38,18 @@ import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { injectPrompt } from './inject.js';
 import { lockIsLive, lockPath, readLock } from './lock.js';
 import { attachTerminal, PtySession, resolveExecutable } from './pty.js';
+import { clearStopRequest, writeStopRequest } from './stop-request.js';
+
+/**
+ * How long to let a bridge finish before killing it.
+ *
+ * It has to notice the request (within a tick), read the registry, seal its
+ * chunks and push — a push being the slow part, and the one that has to complete,
+ * because it is what tells the phone the session ended. Generous because the
+ * alternative is a relay left claiming a finished session is live; bounded
+ * because this is time the terminal sits at a shell after Claude Code has gone.
+ */
+const STOP_GRACE_MS = 15_000;
 
 export interface CcrOptions {
   /** Arguments passed straight through to Claude Code. */
@@ -188,7 +200,14 @@ export async function ensureBridge(
  * The other-session check exists because two `ccr` sessions share one bridge: the
  * second finds the first's lock and starts nothing of its own, so without this
  * check the first to exit would take the bridge down underneath the session that
- * is still running.
+ * is still running. It also closes a race that asking the bridge to stop on its
+ * own could not: the check happens before the request is written, so a second
+ * `ccr` that has started but not yet registered still counts as `others`.
+ *
+ * The stop is a **request**, not a signal — see `stop-request.ts` for why. The
+ * bridge answers it by reading the registry one last time, sealing its chunks,
+ * writing a final head and index, and publishing, which is the only way the
+ * phone ever learns the session ended.
  */
 async function stopOwnedBridge(
   child: ChildProcess | null,
@@ -206,17 +225,28 @@ async function stopOwnedBridge(
     return;
   }
 
-  child.kill();
+  // A leftover request names an older bridge and is ignored by the one running
+  // now, but overwriting is not the same as relying on that: the file should
+  // describe this stop and nothing else.
+  await clearStopRequest(config.stateDir);
+  await writeStopRequest(config.stateDir, pid).catch(() => {});
 
-  // Windows has no signals, so `kill` terminates the process outright and the
-  // bridge's own shutdown never runs: its lock is left behind, and the next
-  // `ccr` would read that as a live bridge within `lockStaleMs` and decline to
-  // start one — leaving a session nobody is watching, which is the whole thing
-  // this is here to prevent. So the lock goes when the process does.
+  const stopped = await waitForExit(child, STOP_GRACE_MS);
+  if (!stopped) {
+    log(`the bridge (pid ${pid}) has not stopped after ${Math.round(STOP_GRACE_MS / 1000)}s`);
+    child.kill();
+  }
+
+  await clearStopRequest(config.stateDir);
+
+  // A forced kill cannot run the bridge's shutdown, so its lock is left behind —
+  // and the next `ccr` would read that as a live bridge within `lockStaleMs` and
+  // decline to start one, leaving a session nobody is watching, which is the
+  // whole thing this is here to prevent. So the lock goes when the process does.
   //
   // Nothing is lost by the abrupt exit: an unsealed chunk is recovered from the
   // file on the next open, which is the same path a crash takes.
-  if (!(await waitForExit(child, 3_000))) {
+  if (!stopped && !(await waitForExit(child, 3_000))) {
     log(`the bridge (pid ${pid}) has not exited; it will be taken over once its lock goes stale`);
   }
 

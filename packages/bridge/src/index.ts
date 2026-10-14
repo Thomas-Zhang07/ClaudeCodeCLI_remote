@@ -61,6 +61,7 @@ import {
 import { lockAgeMs, lockIsLive, lockPath, readLock } from './lock.js';
 import { SerialQueue } from './queue.js';
 import { advanceLastMainKind, resumeSeq, SessionAggregator } from './session.js';
+import { isStopRequestFor, readStopRequest } from './stop-request.js';
 import { Tailer, type TailState } from './tailer.js';
 
 /**
@@ -170,8 +171,25 @@ interface SessionRuntime {
   lastMainEventAt: number;
 }
 
+/**
+ * What the bridge needs from whoever owns its lifetime.
+ *
+ * The bridge does not exit on its own: honouring a stop request means finishing
+ * the work in flight, not calling `process.exit` from inside a tick, and a
+ * process that ends itself is a process no test can hold still.
+ */
+export interface BridgeOptions {
+  /**
+   * Called once when a `ccr` session has asked this bridge to stop.
+   *
+   * The owner is expected to run `stop()` and then exit.
+   */
+  onStopRequested?: (reason: string) => void;
+}
+
 export class Bridge {
   readonly #config: BridgeConfig;
+  readonly #options: BridgeOptions;
   #sessions = new Map<string, SessionRuntime>();
   #registry = new Map<string, RegistryEntry>();
   #persisted: PersistedState = { version: 1, tails: {}, sessions: {}, seenPrompts: [] };
@@ -184,7 +202,17 @@ export class Bridge {
   /** Sessions launched through `ccr`, by pid, refreshed with the registry. */
   #controlledPids = new Map<number, ControlledSession>();
   #publishTimer: NodeJS.Timeout | null = null;
-  #publishing = false;
+  /**
+   * The publish currently running, if any.
+   *
+   * Kept as the promise rather than a boolean so shutdown can *wait* for one
+   * instead of racing it — the last publish of a process is the one that carries
+   * the session's ending, and losing that race leaves the phone reading `active`
+   * from a relay nothing will ever correct.
+   */
+  #publishInFlight: Promise<void> | null = null;
+  /** A stop request has been seen and handed on; do not hand it on twice. */
+  #honouringStop = false;
   /**
    * Prompts typed into a session, awaiting evidence that they landed.
    *
@@ -207,8 +235,9 @@ export class Bridge {
   /** The hook receiver, or null when it could not start. */
   #hooks: HookServer | null = null;
 
-  constructor(config: BridgeConfig) {
+  constructor(config: BridgeConfig, options: BridgeOptions = {}) {
     this.#config = config;
+    this.#options = options;
   }
 
   get sessions(): ReadonlyMap<string, SessionRuntime> {
@@ -362,7 +391,9 @@ export class Bridge {
    * published unless something actually asked for it.
    */
   #schedulePublish(): void {
-    if (!this.#relay || this.#publishTimer) return;
+    // A timer set during shutdown would outlive the lock it is publishing under,
+    // and fire against a relay this process has already finished with.
+    if (!this.#running || !this.#relay || this.#publishTimer) return;
     this.#publishTimer = setTimeout(() => {
       this.#publishTimer = null;
       void this.#publish();
@@ -402,20 +433,54 @@ export class Bridge {
     }
   }
 
-  async #publish(): Promise<void> {
+  /**
+   * Publish, if there is anything to publish.
+   *
+   * Only one publish at a time. The debounce timer can fire while a previous
+   * publish is still mid-copy, and two of them racing on the same clone — one
+   * clearing the output subtree while the other copies into it — fails with
+   * EEXIST and loses whichever attempt noticed.
+   */
+  #publish(): Promise<void> {
     const relay = this.#relay;
-    if (!relay || !this.#relayDirty) return;
+    if (!relay || !this.#relayDirty) return Promise.resolve();
 
-    // Only one publish at a time. The debounce timer can fire while a previous
-    // publish is still mid-copy, and two of them racing on the same clone —
-    // one clearing the output subtree while the other copies into it — fails
-    // with EEXIST and loses whichever attempt noticed.
-    if (this.#publishing) {
+    if (this.#publishInFlight !== null) {
       this.#republish = true;
-      return;
+      return this.#publishInFlight;
     }
 
-    this.#publishing = true;
+    const run = this.#runPublish().finally(() => {
+      if (this.#publishInFlight === run) this.#publishInFlight = null;
+    });
+    this.#publishInFlight = run;
+    return run;
+  }
+
+  /**
+   * Publish now, whatever the debounce would have said.
+   *
+   * This is the last thing the bridge does before it exits, and it is the only
+   * publish that carries a session's *ending*: a session that has stopped
+   * produces no further event, so nothing else would ever mark it. Waiting on an
+   * in-flight publish first is deliberate — the two would otherwise race on the
+   * same clone, and the loser is whichever of them the process finished with.
+   *
+   * Marking the relay dirty happens **after** that wait, and the order is the
+   * whole trick: a publish clears the flag on its way out, so setting it first
+   * means the flag is already back to false by the time the only publish that
+   * matters reads it — and that publish then finds nothing to send.
+   */
+  async #publishNow(): Promise<void> {
+    if (this.#publishInFlight !== null) await this.#publishInFlight.catch(() => {});
+    this.#relayDirty = true;
+    await this.#publish();
+  }
+
+  async #runPublish(): Promise<void> {
+    const relay = this.#relay;
+    if (!relay) return;
+
     try {
       // Seal every open chunk before publishing, so anything the reader can
       // fetch is complete.
@@ -436,7 +501,6 @@ export class Bridge {
     } catch (error) {
       process.stderr.write(`[relay] publish error: ${String(error)}\n`);
     } finally {
-      this.#publishing = false;
       // A trigger that arrived mid-publish must not be dropped: there may be no
       // further turn boundary for a long time, and the data would sit unsent.
       if (this.#republish) {
@@ -751,10 +815,24 @@ export class Bridge {
     await rm(lockPath(this.#config.stateDir), { force: true }).catch(() => {});
   }
 
+  /**
+   * Finish, and leave the relay saying what is true.
+   *
+   * The order matters at the end. The registry is read *first* so the last thing
+   * published describes the world as it is now — in the case this exists for,
+   * the `ccr` session has already unregistered and the session reads `ended` —
+   * and the publish is *last*, after every file it carries has been written,
+   * because a relay that is told about a state it cannot yet read is no better
+   * than one that was never told.
+   */
   async stop(): Promise<void> {
     this.#running = false;
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
+    if (this.#publishTimer !== null) {
+      clearTimeout(this.#publishTimer);
+      this.#publishTimer = null;
+    }
 
     // Closed before anything else, so a hook arriving mid-shutdown cannot be
     // answered with state that is about to disappear.
@@ -762,12 +840,17 @@ export class Bridge {
     this.#hooks = null;
     await hooks?.close().catch(() => {});
 
+    await this.#refreshRegistry().catch(() => {});
+
     // Seal every open chunk so nothing is left unadvertised.
     for (const runtime of this.#sessions.values()) {
       await runtime.chunker.finish().catch(() => {});
       await this.#writeHead(runtime).catch(() => {});
     }
+
+    await this.#writeIndex(true).catch(() => {});
     await this.#persist();
+    await this.#publishNow().catch(() => {});
     await this.#releaseLock();
   }
 
@@ -918,7 +1001,20 @@ export class Bridge {
     for (const runtime of this.#sessions.values()) {
       const entry = this.#registry.get(runtime.sessionId) ?? null;
       const controllable = entry !== null && this.#controlledPids.has(entry.pid);
-      if (runtime.aggregator.applyRegistry(entry, controllable)) runtime.stateDirty = true;
+      if (!runtime.aggregator.applyRegistry(entry, controllable)) continue;
+
+      runtime.stateDirty = true;
+      // **A state change is not an event, and nothing else would publish it.**
+      // The registry is where a session ending is observed — its transcript just
+      // stops, so there is no last line to trigger a push on. Without this the
+      // phone keeps whatever status it was last told, forever, because the thing
+      // that would have corrected it emits nothing more.
+      //
+      // These transitions are rare — starting, ending, going idle, blocking,
+      // becoming controllable — as against turn boundaries, which are frequent,
+      // so this is nowhere near the push budget the debounce exists to protect.
+      this.#relayDirty = true;
+      this.#schedulePublish();
     }
   }
 
@@ -929,6 +1025,24 @@ export class Bridge {
   async #tick(): Promise<void> {
     if (!this.#running) return;
 
+    // Checked on every tick rather than on the slower registry interval: this is
+    // the difference between a `ccr` that exits promptly and one that sits at the
+    // shell for three seconds after Claude Code is gone.
+    //
+    // The claim is taken *before* the read, because ticks overlap: two of them
+    // awaiting the same file would both find the request and both ask for a
+    // shutdown. Released again when there was nothing to answer.
+    if (!this.#honouringStop) {
+      this.#honouringStop = true;
+      if (await this.#stopWasRequested().catch(() => false)) {
+        const reason = 'a ccr session asked this bridge to stop';
+        if (this.#options.onStopRequested) this.#options.onStopRequested(reason);
+        else process.stderr.write(`[bridge] ${reason}, but nothing is listening for it\n`);
+        return;
+      }
+      this.#honouringStop = false;
+    }
+
     for (const runtime of this.#sessions.values()) {
       try {
         await this.#tickSession(runtime);
@@ -938,6 +1052,18 @@ export class Bridge {
     }
 
     await this.#writeIndex();
+  }
+
+  /**
+   * Whether a `ccr` session has asked this exact process to stop.
+   *
+   * The pid check is the whole safety of it. A request left behind by a `ccr`
+   * that crashed names a bridge that is already gone, and without the check that
+   * file would stop whichever bridge started next — which is the same class of
+   * bug the request exists to fix.
+   */
+  async #stopWasRequested(): Promise<boolean> {
+    return isStopRequestFor(await readStopRequest(this.#config.stateDir), process.pid);
   }
 
   async #tickSession(runtime: SessionRuntime): Promise<void> {
@@ -1085,10 +1211,17 @@ export class Bridge {
     await atomicWriteJson(join(dir, 'subagents.json'), runtime.aggregator.subagentTree());
   }
 
-  /** Publish the session list the phone reads first. */
-  async #writeIndex(): Promise<void> {
+  /**
+   * Publish the session list the phone reads first.
+   *
+   * `force` is for shutdown. The throttle below is a courtesy to the disk during
+   * ordinary ticking, but the last write a process makes is the one the relay
+   * keeps, and skipping it leaves the phone reading the status from two seconds
+   * before the session ended.
+   */
+  async #writeIndex(force = false): Promise<void> {
     const now = Date.now();
-    if (now - this.#lastIndexWrite < 2_000) return;
+    if (!force && now - this.#lastIndexWrite < 2_000) return;
     this.#lastIndexWrite = now;
 
     const sessions: SessionIndexEntry[] = [...this.#sessions.values()]
@@ -1221,7 +1354,20 @@ function extractPromptId(raw: unknown): string | null {
 
 export async function main(): Promise<void> {
   const config = bootstrapConfig();
-  const bridge = new Bridge(config);
+
+  const shutdown = (): void => {
+    void bridge.stop().then(() => process.exit(0));
+  };
+
+  // The same exit as a signal takes. A `ccr` session asking us to stop is not a
+  // request to die on the spot: the last registry read, the last head and the
+  // last publish are the entire point of it being asked rather than killed.
+  const bridge = new Bridge(config, {
+    onStopRequested: (reason) => {
+      process.stderr.write(`[bridge] stopping: ${reason}\n`);
+      shutdown();
+    },
+  });
 
   await bridge.start();
   process.stdout.write(
@@ -1230,9 +1376,6 @@ export async function main(): Promise<void> {
       `  state  -> ${config.stateDir}\n`,
   );
 
-  const shutdown = (): void => {
-    void bridge.stop().then(() => process.exit(0));
-  };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }
