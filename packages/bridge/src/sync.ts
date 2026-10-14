@@ -21,7 +21,7 @@
 import { cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { authenticatedUrl, ensureClone, git, gitOrThrow } from './git.js';
+import { authenticatedUrl, ensureClone, fetchArgs, git, gitOrThrow } from './git.js';
 
 export interface RelayOptions {
   repoUrl: string;
@@ -186,7 +186,7 @@ export class RelaySync {
 
   /** Bring a local branch up to date with its remote, if it has moved. */
   async #fastForward(dir: string, branch: string): Promise<void> {
-    const fetched = await git(['fetch', 'origin', branch], {
+    const fetched = await git(this.#fetchArgs(branch), {
       cwd: dir,
       bypassProxy: true,
       timeoutMs: 120_000,
@@ -198,6 +198,16 @@ export class RelaySync {
     await git(['merge', '--ff-only', 'FETCH_HEAD'], { cwd: dir });
   }
 
+  /**
+   * A fetch that carries the credential and keeps the tracking ref current.
+   *
+   * See `fetchArgs`: fetching from `origin` uses the clone's configured URL,
+   * which deliberately has no token in it, so it is anonymous.
+   */
+  #fetchArgs(branch: string): string[] {
+    return fetchArgs({ repoUrl: this.#options.repoUrl, token: this.#options.token, branch });
+  }
+
   // -------------------------------------------------------------------------
   // Inbound
   // -------------------------------------------------------------------------
@@ -205,14 +215,9 @@ export class RelaySync {
   /** Fetch and list prompts the phone has written. */
   async listInbound(): Promise<string[]> {
     if (!this.#inReady) return [];
-    const { inBranch, inCloneDir } = this.#options;
+    const { inCloneDir } = this.#options;
 
-    await git(['fetch', 'origin', inBranch], {
-      cwd: inCloneDir,
-      bypassProxy: true,
-      timeoutMs: 120_000,
-    });
-    await git(['merge', '--ff-only', 'FETCH_HEAD'], { cwd: inCloneDir });
+    await this.#refreshInbound();
 
     const dir = join(inCloneDir, IN_DIR);
     const names: string[] = [];
@@ -253,15 +258,111 @@ export class RelaySync {
    */
   async markConsumed(relativePaths: readonly string[]): Promise<void> {
     if (relativePaths.length === 0 || !this.#inReady) return;
-    const { inCloneDir } = this.#options;
 
+    await this.#moveConsumed(relativePaths);
+    await this.#commitAndPushConsumed();
+  }
+
+  /**
+   * Bring the working tree up to date with the inbound branch.
+   *
+   * A failed push leaves the local branch *ahead* of the remote, and the phone's
+   * next prompt is written on top of the older remote head — so the two diverge,
+   * and `merge --ff-only` can never succeed again. Treating that as a
+   * transient failure was not safe: the fetch still updates the objects, but the
+   * working tree never moves, so every prompt written after the failed push sits
+   * on disk, is listed by nobody, and is **silently ignored for good**.
+   */
+  async #refreshInbound(): Promise<void> {
+    const { inCloneDir, inBranch } = this.#options;
+
+    const fetched = await git(this.#fetchArgs(inBranch), {
+      cwd: inCloneDir,
+      bypassProxy: true,
+      timeoutMs: 120_000,
+    });
+    if (fetched.code !== 0) return;
+
+    const merged = await git(['merge', '--ff-only', 'FETCH_HEAD'], { cwd: inCloneDir });
+    if (merged.code === 0) return;
+
+    await this.#recoverInbound();
+  }
+
+  /**
+   * Re-apply a consume whose push failed, on top of the remote head.
+   *
+   * A reset-then-reapply, and both halves are safe in the one direction that
+   * matters:
+   *
+   *  - The **reset** makes the working tree exactly the remote head, so every
+   *    prompt the remote still holds reappears — including the ones we consumed
+   *    (their move never reached the remote) and, crucially, any prompt we have
+   *    not consumed at all. Nothing in `in/` is discarded: everything absent
+   *    from the remote is by definition something we never published, and the
+   *    only such commits are ours.
+   *  - **Re-applying** the moves is idempotent — moving a file into `.done/`
+   *    twice is the same as moving it once — and the list comes from the
+   *    divergence itself, so nothing we consumed is resurrected and nothing we
+   *    did not consume is touched.
+   *
+   * A crash between the two is survivable: the prompts come back as unconsumed,
+   * but `seenPrompts` (persisted by the bridge, not here) means a prompt already
+   * delivered is not delivered again.
+   */
+  async #recoverInbound(): Promise<void> {
+    const { inCloneDir, inBranch } = this.#options;
+
+    const base = await git(['merge-base', 'HEAD', 'FETCH_HEAD'], { cwd: inCloneDir });
+    if (base.code !== 0) return; // Unrelated histories; not ours to repair.
+
+    // The files this clone moved into `.done/` and never managed to publish.
+    // Rename detection is off so a move reads as delete-plus-add, which is what
+    // the filter below is written against.
+    const moved = await git(
+      [
+        'diff',
+        '--name-only',
+        '--no-renames',
+        '--diff-filter=D',
+        base.stdout.trim(),
+        'HEAD',
+        '--',
+        IN_DIR,
+      ],
+      { cwd: inCloneDir },
+    );
+    if (moved.code !== 0) return;
+
+    const consumed = moved.stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith(`${IN_DIR}/`) && !line.startsWith(`${IN_DIR}/.done/`))
+      .map((line) => line.slice(IN_DIR.length + 1));
+
+    this.#log(
+      `inbound diverged from ${inBranch}; re-applying ${consumed.length} consumed prompt(s) so new ones are not ignored`,
+    );
+
+    await gitOrThrow(['reset', '--hard', 'FETCH_HEAD'], { cwd: inCloneDir });
+    await this.#moveConsumed(consumed);
+    await this.#commitAndPushConsumed();
+  }
+
+  async #moveConsumed(relativePaths: readonly string[]): Promise<void> {
+    const { inCloneDir } = this.#options;
     await mkdir(join(inCloneDir, IN_DONE_DIR), { recursive: true });
 
     for (const relative of relativePaths) {
       const from = join(inCloneDir, IN_DIR, relative);
       const to = join(inCloneDir, IN_DONE_DIR, relative.replace(/[/\\]/g, '__'));
+      // Already moved, or never present: idempotent by design.
       await rename(from, to).catch(() => {});
     }
+  }
+
+  async #commitAndPushConsumed(): Promise<void> {
+    const { inCloneDir, inBranch } = this.#options;
 
     await gitOrThrow(['add', '-A', '--', IN_DIR], { cwd: inCloneDir });
     const staged = await git(['diff', '--cached', '--quiet'], { cwd: inCloneDir });
@@ -270,11 +371,16 @@ export class RelaySync {
     await gitOrThrow(['commit', '-m', 'relay: consume inbound prompts'], { cwd: inCloneDir });
 
     const url = authenticatedUrl(this.#options.repoUrl, this.#options.token);
-    await git(['push', url, `HEAD:${this.#options.inBranch}`], {
+    const pushed = await git(['push', url, `HEAD:${inBranch}`], {
       cwd: inCloneDir,
       bypassProxy: true,
       timeoutMs: 120_000,
     });
+    if (pushed.code !== 0) {
+      this.#log(
+        `inbound push failed: ${pushed.stderr.trim().split('\n').at(-1) ?? ''} (will re-apply on the next poll)`,
+      );
+    }
   }
 }
 

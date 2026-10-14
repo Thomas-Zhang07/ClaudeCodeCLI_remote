@@ -113,8 +113,15 @@ export function clipShort(input: string, maxBytes: number = BUDGETS.short): stri
 /**
  * Hard ceiling for a serialized event.
  *
- * The chunk writer asserts against this: a bug that lets a huge field through
- * would otherwise be discovered only when the repo bloats.
+ * Enforced by `ChunkWriter.append`, which refuses an event that exceeds it: a
+ * bug that lets a huge field through would otherwise be discovered only when
+ * the repo bloats. Every field is cut to one of the `BUDGETS` above, so a
+ * conforming event lands far below this — the largest in a real relay was
+ * ~13 KB.
+ *
+ * A ceiling rather than an exact bound, because serialized size is not the same
+ * as truncated size: JSON escaping expands what `truncateText` measured, so
+ * there is deliberately room between the budgets' sum and this number.
  */
 export const MAX_EVENT_BYTES = 20_000;
 

@@ -1,10 +1,11 @@
-import { appendFile, mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { ChunkWriter, chunkFilename, crc32, sha256 } from '../src/chunker.js';
+import { MAX_EVENT_BYTES } from '@ccr/shared';
 import type { ChunkEntry, ChunkManifest, NormalizedEvent, SessionState } from '@ccr/shared';
 
 let dir: string;
@@ -204,6 +205,84 @@ describe('ChunkWriter', () => {
 
       expect(await second.readLastMainKind()).toBe('turn_end');
     });
+
+    /**
+     * The bridge synthesizes a few kinds about its own bookkeeping. They are not
+     * something the session *did*, and letting one answer that question wedged
+     * sessions shut: a recorded refusal is itself an `injection` event, so the
+     * session looked permanently mid-turn and refusing again appended another.
+     */
+    describe('bridge-synthesized events', () => {
+      const synthesized = (
+        seq: number,
+        kind: string,
+        extra: Record<string, unknown>,
+      ): NormalizedEvent => ({ ...event(seq), kind, ...extra }) as NormalizedEvent;
+
+      it('leaves a finished turn in place when a title changes', async () => {
+        const w = new ChunkWriter({ dir });
+        await w.open('sess-1');
+        await w.append({ ...event(0), kind: 'turn_end' });
+        await w.append(synthesized(1, 'title', { title: 'Renamed', source: 'ai' }));
+        await w.finish();
+
+        // `ai-title` re-fires constantly and arrives between turns. If it
+        // answered this question, the guard would refuse a session that has
+        // plainly finished.
+        expect(await w.readLastMainKind()).toBe('turn_end');
+      });
+
+      it('does not let the record of a prompt’s fate become session activity', async () => {
+        const w = new ChunkWriter({ dir });
+        await w.open('sess-1');
+        await w.append({ ...event(0), kind: 'turn_end' });
+        await w.append(
+          synthesized(1, 'injection', { promptId: 'p1', state: 'rejected', detail: 'nope' }),
+        );
+        await w.finish();
+
+        expect(await w.readLastMainKind()).toBe('turn_end');
+      });
+
+      it('ignores an attention note', async () => {
+        const w = new ChunkWriter({ dir });
+        await w.open('sess-1');
+        await w.append({ ...event(0), kind: 'turn_end' });
+        await w.append(synthesized(1, 'attention', { text: 'waiting', level: 'waiting' }));
+        await w.finish();
+
+        expect(await w.readLastMainKind()).toBe('turn_end');
+      });
+
+      it('still reports a session whose only events are synthesized as unknown', async () => {
+        const w = new ChunkWriter({ dir });
+        await w.open('sess-1');
+        await w.append(synthesized(0, 'injection', { promptId: 'p1', state: 'rejected' }));
+        await w.finish();
+
+        // Nothing transcript-side has happened, so there is no answer — and the
+        // guard treats "unknown" as refusing rather than as idle.
+        expect(await w.readLastMainKind()).toBeNull();
+      });
+    });
+  });
+
+  it('refuses an event over MAX_EVENT_BYTES, before touching the chunk', async () => {
+    // The ceiling is asserted by the writer rather than merely documented: a
+    // field that escaped truncation would otherwise be discovered only when the
+    // relay bloated.
+    const w = new ChunkWriter({ dir });
+    await w.open('sess-1');
+
+    const huge: NormalizedEvent = { ...event(0), text: 'x'.repeat(MAX_EVENT_BYTES) };
+    await expect(w.append(huge)).rejects.toThrow(/MAX_EVENT_BYTES/);
+
+    // Rejected before any state moved, so the chunk is still empty and the
+    // writer can carry on.
+    expect(existsSync(join(dir, chunkFilename(1)))).toBe(false);
+    await w.append(event(1));
+    await w.finish();
+    expect((await readFile(join(dir, chunkFilename(1)), 'utf8')).trim().split('\n')).toHaveLength(2);
   });
 
   it('reports a chunk range the reader can trust', async () => {
@@ -391,6 +470,72 @@ describe('ChunkWriter', () => {
       // The highest sequence written, recovered from the sealed chunk — not a
       // counter reset to zero, which would let the writer reissue a sequence.
       expect(second.lastSeq).toBe(1);
+    });
+
+    it('cuts a torn final line away instead of appending onto it', async () => {
+      // `append` opens with 'a', so a fragment left by a crash would be welded
+      // to the next JSON object — `{"kind":"assist{"seq":2,…}`. That line never
+      // parses again, and because the sentinel covers the whole chunk the
+      // reader rejects all of it, permanently, including the events written
+      // before the crash.
+      const first = new ChunkWriter({ dir });
+      await first.open('sess-1');
+      await first.append(event(0));
+      await first.append(event(1));
+      await appendFile(join(dir, chunkFilename(1)), '{"kind":"assist');
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+      expect(second.lastSeq).toBe(1);
+      await second.append(event(2));
+      await second.finish();
+
+      const lines = (await readFile(join(dir, chunkFilename(1)), 'utf8')).trim().split('\n');
+      for (const line of lines) expect(() => JSON.parse(line)).not.toThrow();
+      expect(lines.map((l) => JSON.parse(l).seq ?? 'end')).toEqual([0, 1, 2, 'end']);
+    });
+
+    it('numbers above the chunks on disk when the manifest is corrupt', async () => {
+      // Resetting to chunk 1 would re-enter a chunk the phone has already
+      // cached and rewrite it under the same number — invisible to the reader,
+      // which is entitled to assume a sealed chunk never changes.
+      const first = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await first.open('sess-1');
+      for (let i = 1; i <= 12; i++) await first.append(event(i, 60));
+      await first.finish();
+
+      const files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+      expect(files.length).toBeGreaterThan(1);
+      const highest = Math.max(...files.map((f) => Number.parseInt(/events-(\d+)/.exec(f)![1]!, 10)));
+      const digest = sha256(await readFile(join(dir, chunkFilename(1))));
+
+      await writeFile(join(dir, 'manifest.json'), '{ this is not json at all');
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+
+      expect(second.chunkNumber).toBe(highest + 1);
+      await second.append(event(100, 60));
+      await second.finish();
+
+      // The already-published chunk is byte-identical to what the reader cached.
+      expect(sha256(await readFile(join(dir, chunkFilename(1))))).toBe(digest);
+    });
+
+    it('treats a manifest without a chunk list as corrupt', async () => {
+      const first = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await first.open('sess-1');
+      for (let i = 1; i <= 8; i++) await first.append(event(i, 60));
+      await first.finish();
+
+      const files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+      const highest = Math.max(...files.map((f) => Number.parseInt(/events-(\d+)/.exec(f)![1]!, 10)));
+
+      await writeFile(join(dir, 'manifest.json'), JSON.stringify({ sessionId: 'sess-1' }));
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+      expect(second.chunkNumber).toBe(highest + 1);
     });
   });
 });

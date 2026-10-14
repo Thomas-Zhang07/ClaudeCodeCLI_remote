@@ -24,9 +24,22 @@ export interface TailState {
   path: string;
   /** File identity (inode / file index). Detects replacement, not just growth. */
   identity: string;
+  /**
+   * Position of the first byte not yet turned into a complete line.
+   *
+   * Not simply "how far we have read": bytes buffered as an incomplete line are
+   * held by the framer, which is not persisted, so they must be re-read. See
+   * `getState`.
+   */
   offset: number;
   sizeAtOffset: number;
   mtimeAtOffset: number;
+  /**
+   * True when the tailer is still discarding the fragment a cold start landed
+   * in. Persisted because the fragment's remaining bytes have not arrived yet:
+   * resuming without it would frame those bytes as a line of their own.
+   */
+  skipPartial?: boolean;
 }
 
 export interface TailerOptions {
@@ -71,6 +84,10 @@ export class Tailer {
       this.#offset = state.offset;
       this.#sizeAtOffset = state.sizeAtOffset;
       this.#mtimeAtOffset = state.mtimeAtOffset;
+      // Restored with the offset, not re-derived: a cold start re-seeks only on
+      // first sight, and this is the second sight of a file we were still
+      // resynchronising when the process ended.
+      this.#skipPartial = state.skipPartial === true;
       this.#initialised = true;
     }
   }
@@ -160,14 +177,29 @@ export class Tailer {
     return this.#framer.stats;
   }
 
-  /** Snapshot for persistence. */
+  /** Bytes in the transcript as of the last poll; 0 when never seen. */
+  get size(): number {
+    return this.#sizeAtOffset;
+  }
+
+  /**
+   * Snapshot for persistence.
+   *
+   * The offset persisted is the start of the **incomplete trailing line**, not
+   * the read cursor. Bytes the framer is still holding have produced nothing:
+   * they are neither returned nor parsed yet, and on restart the framer's
+   * buffer is gone. Persisting the read cursor skips them, so a line split
+   * across a restart is delivered as a fragment — its head never read, its tail
+   * framed on its own — which the parser then discards, losing the line.
+   */
   getState(): TailState {
     return {
       path: this.path,
       identity: this.#identity,
-      offset: this.#offset,
+      offset: this.#offset - this.#framer.pendingBytes,
       sizeAtOffset: this.#sizeAtOffset,
       mtimeAtOffset: this.#mtimeAtOffset,
+      skipPartial: this.#skipPartial,
     };
   }
 

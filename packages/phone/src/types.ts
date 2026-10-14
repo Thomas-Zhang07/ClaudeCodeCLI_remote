@@ -22,6 +22,15 @@ export interface SessionIndexEntry {
 export interface RelayIndex {
   version: number;
   generatedAt: string;
+  /**
+   * When the bridge last wrote this file.
+   *
+   * The liveness signal. Gitee keeps answering for hours after the bridge
+   * stops, so a successful request says nothing about whether the PC is still
+   * publishing — this does. Absent on an index written before the field
+   * existed; `generatedAt` is then the same thing under an older name.
+   */
+  heartbeat?: string;
   sessions: SessionIndexEntry[];
   /**
    * Whether the PC will deliver prompts at all.
@@ -63,6 +72,14 @@ export interface SessionHead {
   project: string | null;
   title: string | null;
   status: SessionStatus;
+  /**
+   * When the bridge last wrote this file.
+   *
+   * Not `updatedAt`, which is the session's own clock and stops moving as soon
+   * as the session goes idle — so it cannot answer "is the bridge still there?"
+   * for the one file that is polled while a session is open.
+   */
+  heartbeat?: string;
   /** Set only while `status` is `waiting`; the reason the session needs you. */
   waitingFor: string | null;
   model: string | null;

@@ -25,9 +25,10 @@ import {
   type RegistryEntry,
   type SessionHead,
   type SessionIndexEntry,
+  type SessionState,
 } from '@ccr/shared';
 
-import { ChunkWriter, atomicWriteJson } from './chunker.js';
+import { ChunkWriter, atomicWriteJson, type ChunkRange } from './chunker.js';
 import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { readControlled } from './control.js';
 import { sendControlMessage, type ControlledSession } from './control.js';
@@ -42,7 +43,12 @@ import {
   type HookSessionState,
 } from './hooks.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
-import { injectionRefusal, matchDeliveredTurn, type InjectionRefusal } from './inject.js';
+import {
+  injectionRefusal,
+  isFreshSession,
+  matchDeliveredTurn,
+  type InjectionRefusal,
+} from './inject.js';
 import { RelaySync } from './sync.js';
 import {
   readJson,
@@ -51,7 +57,7 @@ import {
   scanProjects,
   type DiscoveredSession,
 } from './discovery.js';
-import { SessionAggregator } from './session.js';
+import { advanceLastMainKind, resumeSeq, SessionAggregator } from './session.js';
 import { Tailer, type TailState } from './tailer.js';
 
 /**
@@ -505,11 +511,14 @@ export class Bridge {
       hasSession: Boolean(runtime && entry),
       controllable: Boolean(registration),
       lastMainKind: runtime?.lastMainKind ?? null,
-      // Sequence 0 means this bridge has never recorded a single event for the
-      // session, which is what a just-started one looks like. A session that
-      // existed before the bridge began is not fresh: it was cold-started and
-      // replayed, or restored from persisted state, so its sequence is past 0.
-      isFresh: runtime?.aggregator.seq === 0,
+      // Freshness is a fact about the *session*, so it is the transcript that
+      // decides it, not this process's record. Requiring an empty transcript is
+      // what makes "nothing has run" true; `seq === 0` alone only means this
+      // bridge has no chunks for it, which is also what a long-running session
+      // looks like after its output directory is emptied. See `isFreshSession`.
+      isFresh:
+        runtime !== undefined &&
+        isFreshSession(runtime.aggregator.seq, runtime.tailer.size),
       // Passed as they stand even when they are not trusted, so the guard's
       // decision is legible from its inputs; `hooksLive` is what gates using
       // them, and it is false when the stream is missing or has gone quiet.
@@ -824,7 +833,13 @@ export class Bridge {
     });
     await chunker.open(discovered.sessionId);
 
-    const aggregator = new SessionAggregator(discovered.sessionId, saved?.seq ?? 0);
+    // Past everything already written, not merely past the last value the
+    // five-second persist timer happened to catch: the chunker's position comes
+    // from the events on disk, which is what the reader will see.
+    const aggregator = new SessionAggregator(
+      discovered.sessionId,
+      resumeSeq(saved?.seq, chunker.lastSeq),
+    );
 
     this.#sessions.set(discovered.sessionId, {
       sessionId: discovered.sessionId,
@@ -951,9 +966,24 @@ export class Bridge {
     fromAgent = false,
   ): Promise<void> {
     for (const event of events) {
-      await runtime.chunker.append(event);
+      try {
+        await runtime.chunker.append(event);
+      } catch (error) {
+        // An event the writer will not take — the ceiling in `MAX_EVENT_BYTES`
+        // is the designed case — is reported and skipped, rather than thrown at
+        // the caller and taking the rest of the batch with it. The gap in the
+        // sequence is real and the phone will show it, which is the honest
+        // outcome: this event was never written.
+        process.stderr.write(
+          `[bridge] dropped an event from ${runtime.sessionId}: ${String(error)}\n`,
+        );
+        continue;
+      }
+
       if (!fromAgent) {
-        runtime.lastMainKind = event.kind;
+        // Synthesized events are skipped — see SYNTHESIZED_KINDS. A title change
+        // arrives through this same path and must not answer "is the turn over?".
+        runtime.lastMainKind = advanceLastMainKind(runtime.lastMainKind, event.kind);
         // The session's own clock, not the time we read the line: a cold-start
         // replay of yesterday's events must not look like activity now.
         const at = Date.parse(event.ts);
@@ -978,7 +1008,7 @@ export class Bridge {
   /** Write the per-session file the reader polls while a session is open. */
   async #writeHead(runtime: SessionRuntime): Promise<void> {
     const dir = join(this.#config.outDir, 'sessions', runtime.sessionId);
-    const head: SessionHead = { ...runtime.aggregator.state, ...runtime.chunker.range };
+    const head = buildSessionHead(runtime.aggregator.state, runtime.chunker.range, new Date());
 
     await atomicWriteJson(join(dir, 'head.json'), head);
     await atomicWriteJson(join(dir, 'subagents.json'), runtime.aggregator.subagentTree());
@@ -1018,12 +1048,11 @@ export class Bridge {
     const { kept, dropped } = this.#applySessionCap(sessions);
     for (const entry of dropped) await this.#forgetSession(entry.sessionId);
 
-    const index: RelayIndex = {
-      version: 1,
-      generatedAt: new Date().toISOString(),
+    const index = buildRelayIndex({
       sessions: kept,
       injectionEnabled: this.#config.allowInjection,
-    };
+      now: new Date(),
+    });
     await atomicWriteJson(join(this.#config.outDir, 'index.json'), index);
   }
 
@@ -1057,6 +1086,38 @@ export class Bridge {
       force: true,
     }).catch(() => {});
   }
+}
+
+/**
+ * The contents of `head.json`.
+ *
+ * `heartbeat` is the bridge's own clock, not the session's: `updatedAt` stops
+ * moving when the session goes idle, so it cannot answer the one question the
+ * phone has — "is the PC still publishing?" A reader that gets no heartbeat, or
+ * an old one, is told the record has gone stale rather than left believing it
+ * is live because Gitee answered.
+ *
+ * Pure and exported so the promise is testable: it is a contract between two
+ * packages that do not share a build.
+ */
+export function buildSessionHead(state: SessionState, range: ChunkRange, now: Date): SessionHead {
+  return { ...state, ...range, heartbeat: now.toISOString() };
+}
+
+/** The contents of `index.json`, with the same heartbeat alongside `generatedAt`. */
+export function buildRelayIndex(options: {
+  sessions: SessionIndexEntry[];
+  injectionEnabled: boolean;
+  now: Date;
+}): RelayIndex {
+  const at = options.now.toISOString();
+  return {
+    version: 1,
+    generatedAt: at,
+    heartbeat: at,
+    sessions: options.sessions,
+    injectionEnabled: options.injectionEnabled,
+  };
 }
 
 /**

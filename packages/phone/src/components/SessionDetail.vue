@@ -63,6 +63,28 @@ const errorAttention = computed(() => {
   return attention;
 });
 
+/**
+ * An open permission dialog, when the record says so.
+ *
+ * `level: 'waiting'` attention is only ever produced for a permission
+ * notification, so it is the one signal on the phone that identifies this case.
+ *
+ * It is required to be the *newest* entry as well. A dialog stops the session
+ * dead, so nothing can be recorded after it while it is open — and once it is
+ * answered, the next entry is what releases this and brings the button back.
+ * Without that check the flag would latch forever from the first dialog a
+ * session ever showed.
+ */
+const permissionDialog = computed(() => {
+  const d = detail.value;
+  if (!waiting.value || !d) return null;
+
+  const attention = d.summary.latestAttention;
+  const newest = d.events.at(-1);
+  if (!attention || attention.level !== 'waiting') return null;
+  return newest?.kind === 'attention' ? attention : null;
+});
+
 const dropped = computed(() => detail.value?.pruned?.droppedEvents ?? 0);
 
 /**
@@ -96,7 +118,24 @@ function toComposer(): void {
     <section v-if="waiting" class="urgent">
       <p class="urgent-kind">waiting on you</p>
       <p class="urgent-why">{{ head?.waitingFor || 'This session cannot continue without an answer.' }}</p>
-      <button v-if="canWrite" class="urgent-go" type="button" @click="toComposer">write a prompt</button>
+
+      <!-- Offered only when a prompt could actually be typed. A permission
+           dialog swallows anything written to the session — the keystrokes
+           answer the dialog, and can approve the tool it is asking about — so
+           the bridge refuses outright. Sending someone to a composer that will
+           be refused is worse than saying why they have to walk back to the PC. -->
+      <button
+        v-if="canWrite && !permissionDialog"
+        class="urgent-go"
+        type="button"
+        @click="toComposer"
+      >
+        write a prompt
+      </button>
+      <p v-else-if="permissionDialog" class="urgent-blocked">
+        A permission dialog is open on the PC. Answer it there — anything typed here would answer
+        the dialog instead of being submitted.
+      </p>
     </section>
 
     <section v-if="errorAttention" class="cond fault">
@@ -268,6 +307,14 @@ h1 {
   font-size: 11px;
   color: var(--signal);
   border-bottom: 1px solid var(--signal);
+}
+
+.urgent-blocked {
+  margin: 6px 0 0;
+  max-width: var(--measure);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--ink);
 }
 
 /* --- conditions ----------------------------------------------------------- */

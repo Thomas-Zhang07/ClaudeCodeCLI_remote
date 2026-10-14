@@ -588,14 +588,27 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
 
     const pending = blocked === null ? [] : rangeInclusive(blocked.n, head.chunkLast);
 
-    detail.events = assembled.events;
-    detail.summary = summarize(assembled.events);
+    // A pass that stopped before loading the *start* of the range assembles
+    // nothing at all. Replacing the timeline with that blanks the screen for as
+    // many polls as the catch-up takes, which looks exactly like a session with
+    // no history — the worst possible thing to show someone who opened the
+    // phone to find out what happened.
+    const keptPrevious = blocked !== null && loaded.length === 0;
+    if (!keptPrevious) {
+      detail.events = assembled.events;
+      detail.summary = summarize(assembled.events);
+    }
+
     detail.gap = gap;
     detail.resyncing = resyncing;
     // A single outstanding chunk is the newest one, still unsealed — the steady
     // state while a turn streams, and not worth announcing. More than one means
     // a catch-up, which is visible to the reader and so is worth explaining.
-    detail.inFlight = inFlight && !resyncing && pending.length > 1;
+    //
+    // `keptPrevious` is the case that most needs the sentence: nothing loaded,
+    // so the roll above is holding older events. Without it that case would be
+    // the one that stayed silent whenever the session has a single chunk.
+    detail.inFlight = !resyncing && (keptPrevious || (inFlight && pending.length > 1));
     detail.pendingChunks = pending;
     detail.chunksLoaded = loaded.length;
     detail.chunksTotal = head.chunkLast - head.chunkFirst + 1;

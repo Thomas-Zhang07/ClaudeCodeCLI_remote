@@ -31,7 +31,12 @@ const children = computed<SubagentNode[]>(() => (Array.isArray(props.node.childr
           <span class="type">{{ node.agentType || 'agent' }}</span>
           <span class="status">{{ node.status }}</span>
           <span v-if="node.model" class="extra">{{ node.model.replace(/^claude-/, '') }}</span>
-          <span class="extra">{{ formatDurationMs(node.durationMs) }}</span>
+          <!-- Only when there is one. A running agent has no duration yet, and
+               `formatDurationMs` answers `—`, which is a reading rather than a
+               missing one — so every running agent rendered as a row of dashes. -->
+          <span v-if="node.durationMs !== undefined" class="extra">
+            {{ formatDurationMs(node.durationMs) }}
+          </span>
           <span v-if="children.length > 0" class="extra">{{ children.length }} spawned</span>
         </span>
         <span class="desc">{{ node.description || node.agentId }}</span>

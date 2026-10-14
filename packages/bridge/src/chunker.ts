@@ -17,13 +17,15 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
+import { MAX_EVENT_BYTES, isTranscriptEvent } from '@ccr/shared';
 import type {
   ChunkEndSentinel,
   ChunkEntry,
   ChunkManifest,
+  EventKind,
   NormalizedEvent,
 } from '@ccr/shared';
 
@@ -250,27 +252,52 @@ export class ChunkWriter {
     await mkdir(dirname(this.#manifestPath), { recursive: true }).catch(() => {});
 
     if (existsSync(this.#manifestPath)) {
+      let parsed: PersistedManifest | null = null;
       try {
-        const parsed = JSON.parse(await readFile(this.#manifestPath, 'utf8')) as PersistedManifest;
-        if (Array.isArray(parsed.chunks)) {
-          this.#sealed = parsed.chunks;
-          this.#droppedEvents = parsed.droppedEvents ?? 0;
-          this.#sealedBytes = this.#sealed.reduce((sum, c) => sum + c.bytes, 0);
-          this.#chunk = this.#sealed.reduce((max, c) => Math.max(max, c.n), 0) + 1;
-        }
+        parsed = JSON.parse(await readFile(this.#manifestPath, 'utf8')) as PersistedManifest;
       } catch {
+        parsed = null;
+      }
+
+      if (parsed !== null && Array.isArray(parsed.chunks)) {
+        this.#sealed = parsed.chunks;
+        this.#droppedEvents = parsed.droppedEvents ?? 0;
+        this.#sealedBytes = this.#sealed.reduce((sum, c) => sum + c.bytes, 0);
+        this.#chunk = this.#sealed.reduce((max, c) => Math.max(max, c.n), 0) + 1;
+      } else {
         // A corrupt manifest is recoverable: start numbering above whatever chunk
         // files exist, so nothing already written is overwritten.
+        //
+        // Above the *files*, not at 1. Resetting to 1 re-enters the chunk the
+        // previous run was writing, so sealed history the phone has already
+        // cached is rewritten in place under the same number — which the reader
+        // has no way to notice, because immutability is the property it is
+        // entitled to assume.
         this.#sealed = [];
         this.#sealedBytes = 0;
-        this.#chunk = 1;
+        this.#chunk = (await this.#highestChunkOnDisk()) + 1;
       }
     }
 
     const path = join(this.#dir, chunkFilename(this.#chunk));
     if (existsSync(path)) {
       const existing = await readFile(path, 'utf8');
-      for (const line of existing.split('\n')) {
+
+      // Cut a torn final line off before resuming.
+      //
+      // The recovery below deliberately continues an unterminated chunk rather
+      // than discarding its events — but `append` opens with `'a'`, so leaving a
+      // fragment in place welds the next JSON object onto it: `{"kind":"assist`
+      // becomes `{"kind":"assist{"seq":4,…}`. That line never parses again, and
+      // because the sentinel covers the whole chunk the reader rejects all of
+      // it — permanently, and including every event written before the crash.
+      const lastNewline = existing.lastIndexOf('\n');
+      const whole = lastNewline === -1 ? '' : existing.slice(0, lastNewline + 1);
+      if (whole.length !== existing.length) {
+        await truncate(path, Buffer.byteLength(whole, 'utf8'));
+      }
+
+      for (const line of whole.split('\n')) {
         const trimmed = line.trim();
         if (!trimmed) continue;
         try {
@@ -284,12 +311,23 @@ export class ChunkWriter {
           this.#lines++;
           this.#bytes += Buffer.byteLength(`${trimmed}\n`, 'utf8');
         } catch {
-          // A torn final line from the crash that caused this recovery.
+          // A torn line in the middle, which only a partial truncate leaves.
         }
       }
     }
 
     this.#ready = true;
+  }
+
+  /** Highest chunk number with a file on disk, or 0 when there is none. */
+  async #highestChunkOnDisk(): Promise<number> {
+    const names = await readdir(this.#dir).catch(() => [] as string[]);
+    let highest = 0;
+    for (const name of names) {
+      const match = /^events-(\d+)\.jsonl$/.exec(name);
+      if (match) highest = Math.max(highest, Number.parseInt(match[1]!, 10));
+    }
+    return highest;
   }
 
   /**
@@ -301,6 +339,16 @@ export class ChunkWriter {
 
     const line = `${JSON.stringify(event)}\n`;
     const size = Buffer.byteLength(line, 'utf8');
+
+    // The ceiling every event must meet, checked here because this is the one
+    // place all of them pass through and the last before they are published.
+    // Checked before any state moves, so a rejection leaves the chunk exactly as
+    // it was rather than half-advanced.
+    if (size > MAX_EVENT_BYTES) {
+      throw new Error(
+        `event ${event.kind} (seq ${event.seq}) serializes to ${size} bytes, over MAX_EVENT_BYTES (${MAX_EVENT_BYTES})`,
+      );
+    }
 
     if (this.#firstSeq === null) this.#firstSeq = event.seq;
 
@@ -424,7 +472,17 @@ export class ChunkWriter {
           continue; // A torn final line from an unclean shutdown.
         }
         if (parsed.t === 'chunk_end') continue;
-        if (parsed.agentId === null && typeof parsed.kind === 'string') return parsed.kind;
+        // Only what the transcript says. Bridge-synthesized events — a title
+        // change, an attention note, the record of a prompt's fate — describe
+        // this process's bookkeeping, and letting one answer "what did the
+        // main thread last do" latched the guard into refusing forever.
+        if (
+          parsed.agentId === null &&
+          typeof parsed.kind === 'string' &&
+          isTranscriptEvent(parsed.kind as EventKind)
+        ) {
+          return parsed.kind;
+        }
       }
     }
 

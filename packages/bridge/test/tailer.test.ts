@@ -77,6 +77,61 @@ describe('Tailer', () => {
     expect(await second.poll()).toEqual(['{"two":2}']);
   });
 
+  it('delivers a line split across a restart exactly once, whole', async () => {
+    // The offset persisted is the start of the incomplete line, not the read
+    // cursor. Persisting the cursor skips the bytes the framer was still
+    // holding — and the framer's buffer does not survive a restart — so the
+    // line's head is never read and its tail is framed as a fragment and
+    // dropped by the parser.
+    const first = new Tailer(file, OPTIONS);
+    await first.poll();
+
+    await appendFile(file, '{"half":');
+    expect(await first.poll()).toEqual([]);
+    expect(first.pendingBytes).toBeGreaterThan(0);
+
+    const second = new Tailer(file, OPTIONS, first.getState());
+    await appendFile(file, 'true}\n');
+    expect(await second.poll()).toEqual(['{"half":true}']);
+
+    // Whole means whole: the same line is not emitted again on the next poll.
+    expect(await second.poll()).toEqual([]);
+  });
+
+  it('re-reads a split multi-byte character whole across a restart', async () => {
+    const first = new Tailer(file, OPTIONS);
+    await first.poll();
+
+    const line = Buffer.from('{"t":"中文"}\n', 'utf8');
+    await appendFile(file, line.subarray(0, 10));
+    expect(await first.poll()).toEqual([]);
+
+    const second = new Tailer(file, OPTIONS, first.getState());
+    await appendFile(file, line.subarray(10));
+    const out = await second.poll();
+
+    expect(out).toEqual(['{"t":"中文"}']);
+    expect(out.join('')).not.toContain('�');
+  });
+
+  it('keeps discarding a cold start’s fragment across a restart', async () => {
+    // A cold start lands inside a line and resynchronises at the next newline.
+    // If the process ends before that newline arrives, restarting without the
+    // skip flag frames the fragment's tail as a line of its own — a bogus
+    // record built from the middle of a real one.
+    await writeFile(file, 'x'.repeat(1000));
+    const first = new Tailer(file, { coldStartBytes: 200 });
+    expect(await first.poll()).toEqual([]);
+
+    const second = new Tailer(file, { coldStartBytes: 200 }, first.getState());
+    await appendFile(file, 'y}\n');
+    expect(await second.poll()).toEqual([]);
+
+    // And the next complete line is delivered normally.
+    await appendFile(file, '{"after":1}\n');
+    expect(await second.poll()).toEqual(['{"after":1}']);
+  });
+
   it('resets when the file is truncated rather than losing position', async () => {
     const t = new Tailer(file, OPTIONS);
     await t.poll();

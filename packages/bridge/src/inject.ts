@@ -63,6 +63,32 @@ export function matchDeliveredTurn(
   });
 }
 
+/**
+ * Whether a session is new enough to be provably safe to type into.
+ *
+ * A brand-new session is safe by a different route from a finished turn:
+ * nothing has run, so there is nothing to be blocked on, and no permission
+ * dialog can be open. This is what lets the phone *begin* a conversation rather
+ * than only join one.
+ *
+ * **Both conditions are required, and the transcript one is the load-bearing
+ * one.** "This bridge has recorded no event for the session" is a statement
+ * about the bridge, not about the session: delete the published chunks, point
+ * the bridge at a fresh output directory, or start it against a machine whose
+ * state file was lost, and a session that has been running for hours reads as
+ * having recorded nothing. A prompt would then be typed into whatever is on
+ * screen — and if that is a permission dialog, typing *answers* it, which can
+ * approve a tool rather than submit anything. Requiring the transcript itself
+ * to be empty makes freshness a fact about the session: no transcript, nothing
+ * has ever run.
+ *
+ * @param recordedSeq events this bridge has sequenced for the session.
+ * @param transcriptBytes size of the session's transcript file, 0 when empty.
+ */
+export function isFreshSession(recordedSeq: number, transcriptBytes: number): boolean {
+  return recordedSeq === 0 && transcriptBytes === 0;
+}
+
 export interface InjectionContext {
   /** The operator has allowed prompts at all. */
   injectionEnabled: boolean;
@@ -73,13 +99,11 @@ export interface InjectionContext {
   /** Kind of the most recent main-thread event, or null if there is none. */
   lastMainKind: string | null;
   /**
-   * The session has recorded nothing at all — it has just been started.
+   * The session is provably new: nothing has run in it, so no dialog can be
+   * open and typing cannot land on one.
    *
-   * Distinct from "we do not know", and the distinction matters: a brand new
-   * session is provably safe to type into, because nothing has run yet so no
-   * dialog can be open. Without this the guard would refuse every prompt to a
-   * freshly started session, meaning a conversation could only ever be
-   * continued from the phone, never begun.
+   * Computed by `isFreshSession`, which is deliberately stricter than "this
+   * process has no record of it" — see there.
    */
   isFresh: boolean;
   /**

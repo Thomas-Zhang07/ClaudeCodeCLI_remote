@@ -15,9 +15,11 @@
 
 import {
   buildSubagentTree,
+  isTranscriptEvent,
   parseTranscriptEntry,
   parseSubagentMeta,
   type EventDraft,
+  type EventKind,
   type NormalizedEvent,
   type RegistryEntry,
   type SessionState,
@@ -26,6 +28,41 @@ import {
   type SubagentNode,
   type SubagentStatus,
 } from '@ccr/shared';
+
+/**
+ * Where sequencing resumes for a session.
+ *
+ * The persisted sequence is written on a five-second timer, so it can trail the
+ * chunker by however many events arrived inside that window — and the chunker
+ * has already written those into the open chunk. Resuming from the persisted
+ * value alone would therefore reissue sequences that are already on disk: two
+ * events would share a `seq`, and the phone's assembler, which insists on a
+ * strictly increasing stream, would report a gap and withhold everything after
+ * it.
+ *
+ * The chunker's own position is authoritative — it is derived from the events
+ * that were actually written, which is what the reader will see. The larger of
+ * the two can never reissue a sequence, and never skips one either.
+ */
+export function resumeSeq(savedSeq: number | undefined, chunkerLastSeq: number): number {
+  return Math.max(savedSeq ?? 0, chunkerLastSeq + 1);
+}
+
+/**
+ * The last main-thread kind, after appending one event.
+ *
+ * Bridge-synthesized kinds are not activity and must leave the answer alone.
+ * That distinction is load-bearing for the injection guard, which asks what the
+ * session last *did*: letting an `injection` event answer that question latched
+ * a session into refusing forever, because recording the refusal was itself the
+ * event that kept it mid-turn.
+ *
+ * A title change is the same hazard without the loop: it arrives between turns
+ * and would erase a `turn_end` the guard was relying on.
+ */
+export function advanceLastMainKind(current: string | null, kind: EventKind): string | null {
+  return isTranscriptEvent(kind) ? kind : current;
+}
 
 export function createSessionState(sessionId: string): SessionState {
   return {
@@ -160,7 +197,11 @@ export class SessionAggregator {
         stateDirty = true;
       } else {
         const target = signal.agentId;
-        if (target && this.#statuses.get(target) === 'running') continue;
+        // Skip only an agent already reported as finished. The condition was
+        // inverted: it skipped precisely the agents that *were* running, so a
+        // hand-back never closed anything and every subagent stayed "running"
+        // for the life of the session.
+        if (target && this.#statuses.get(target) === 'completed') continue;
         this.#statuses.set(target ?? '', 'completed');
         events.push({
           seq: this.#seq++,

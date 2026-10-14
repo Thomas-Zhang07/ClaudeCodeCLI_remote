@@ -135,6 +135,32 @@ export interface InjectionEvent extends EventBase {
 
 export type InjectionState = 'accepted' | 'queued' | 'delivered' | 'dropped' | 'rejected';
 
+/**
+ * Kinds the bridge synthesizes about its own bookkeeping, rather than reading
+ * from a transcript.
+ *
+ * This distinction is load-bearing for the injection guard, which asks what the
+ * session's main thread last *did*. Recording a prompt's fate used to overwrite
+ * that answer: a refusal appended an `injection` event, the session then looked
+ * permanently mid-turn, and refusing again appended another — so one failed
+ * prompt locked remote entry for that session for good.
+ *
+ * A denylist rather than an allowlist, deliberately. An unrecognised kind is
+ * far safer treated as real transcript activity: that only ever makes the guard
+ * more reluctant, whereas wrongly ignoring real activity could let a prompt be
+ * typed mid-turn.
+ */
+export const SYNTHESIZED_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
+  'title',
+  'attention',
+  'injection',
+]);
+
+/** True when an event came from a transcript rather than the bridge itself. */
+export function isTranscriptEvent(kind: EventKind): boolean {
+  return !SYNTHESIZED_KINDS.has(kind);
+}
+
 export type NormalizedEvent =
   | UserPromptEvent
   | AssistantTextEvent
@@ -199,6 +225,15 @@ export type SessionStatus = 'active' | 'waiting' | 'idle' | 'ended';
  * immutable and sequential, so knowing which numbers exist is enough.
  */
 export interface SessionHead extends SessionState {
+  /**
+   * When the bridge last wrote this file.
+   *
+   * Deliberately not `updatedAt`: that is the *session's* clock and stops moving
+   * the moment the session goes idle, so it cannot answer "is the bridge still
+   * publishing?". This one is rewritten on every write, whatever the session is
+   * doing.
+   */
+  heartbeat?: string;
   /** Lowest chunk number still retained. Above 1 means history was pruned. */
   chunkFirst: number;
   /**
@@ -282,6 +317,19 @@ export interface RelayIndex {
   /** Bumped when the on-disk layout changes, so old phones fail loudly. */
   version: number;
   generatedAt: string;
+  /**
+   * When the bridge last wrote this file.
+   *
+   * A *liveness* signal, distinct from `generatedAt`: both move together here,
+   * but the field exists so the reader has one thing to look for in every file
+   * the bridge publishes, and never has to reason about which timestamp in
+   * which file means "the writer is still alive".
+   *
+   * The phone needs it because Gitee answers `200` for hours after the bridge
+   * stops — reachable is not the same as alive, and claiming `live` from a
+   * successful request is a claim the phone cannot support.
+   */
+  heartbeat?: string;
   sessions: SessionIndexEntry[];
   /**
    * Whether the bridge will actually deliver prompts.

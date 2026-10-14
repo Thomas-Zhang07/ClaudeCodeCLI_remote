@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
+import { parseTs, relativeTime } from '@/lib/format';
 import { useNow } from '@/lib/now';
 import { isConfigured } from '@/lib/settings';
 import { refreshNow, relay, throttledForMs } from '@/stores/relay';
@@ -8,6 +9,46 @@ import { refreshNow, relay, throttledForMs } from '@/stores/relay';
 const now = useNow(1000);
 
 const backoffMs = computed(() => throttledForMs(now.value));
+
+/**
+ * How long without a publish before the PC is treated as not reporting.
+ *
+ * Publishing is event-driven — a turn boundary, a session blocking, a prompt
+ * being injected — so this is a floor on silence, not a heartbeat interval. It
+ * is deliberately short: the cost of guessing "stale" during a quiet minute is
+ * a sentence that says so, and the cost of guessing "live" is a phone that
+ * looks like it is watching a session it stopped hearing from long ago.
+ */
+const STALE_AFTER_MS = 30_000;
+
+/**
+ * The newest liveness timestamp the bridge has published.
+ *
+ * Both files are checked because they are polled at different times: the index
+ * only while browsing the list, a session's head only while that session is
+ * open. Whichever we are actually reading is the one that is current.
+ */
+const lastHeartbeatAt = computed<number | null>(() => {
+  const stamps = [
+    relay.index?.heartbeat,
+    // The same value under an older name — an index or a bridge predating the
+    // heartbeat field. Still written by the bridge, so still a liveness signal.
+    relay.index?.generatedAt,
+    relay.detail?.head?.heartbeat,
+  ];
+
+  let newest: number | null = null;
+  for (const stamp of stamps) {
+    const at = parseTs(stamp);
+    if (at !== null && (newest === null || at > newest)) newest = at;
+  }
+  return newest;
+});
+
+const isStale = computed(() => {
+  const at = lastHeartbeatAt.value;
+  return at === null || now.value - at > STALE_AFTER_MS;
+});
 
 /**
  * Sticky while the last failure was a throttle: the backoff window can elapse
@@ -23,8 +64,10 @@ const phaseLabel = computed(() => {
       return 'loading';
     case 'error':
       return 'offline';
+    // A successful request is not liveness. `live` is only claimed when the
+    // bridge has actually published something recently.
     case 'ready':
-      return 'live';
+      return isStale.value ? 'stale' : 'live';
     default:
       return 'idle';
   }
@@ -34,10 +77,15 @@ const phaseLabel = computed(() => {
  * Two tones, and only two. A recorder is either bringing in the record or it is
  * not; which of the several ways it is failing belongs in the sentence beside
  * the mark.
+ *
+ * A stale PC is a fault for that reason: the record is not coming in. It is
+ * deliberately *not* the same signal as `offline` — Gitee answered, so the
+ * phone is on the network and the relay is reachable, and the sentence beside
+ * the mark says which of the two is missing.
  */
 const tone = computed(() => {
   if (isThrottled.value || relay.phase === 'error') return 'fault';
-  if (relay.phase === 'ready') return 'ok';
+  if (relay.phase === 'ready') return isStale.value ? 'fault' : 'ok';
   return 'neutral';
 });
 
@@ -48,7 +96,15 @@ const detail = computed(() => {
   // `settings`, not the client: the client's fields are private and invisible to
   // reactivity, so reading them here caches the first answer forever.
   if (!isConfigured.value) return 'no relay configured';
-  if (relay.empty) return 'nothing published yet';
+  // A session opened from a deep link has a head but no index yet; that is not
+  // an empty relay.
+  if (relay.index === null && relay.detail === null) return 'nothing published yet';
+  if (isStale.value) {
+    const at = lastHeartbeatAt.value;
+    return at === null
+      ? 'the PC has not published a heartbeat'
+      : `the PC last published ${relativeTime(new Date(at).toISOString(), now.value)}`;
+  }
   return 'up to date';
 });
 </script>

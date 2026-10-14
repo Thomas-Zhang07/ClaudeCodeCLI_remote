@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { SessionAggregator } from '../src/session.js';
+import { advanceLastMainKind, resumeSeq, SessionAggregator } from '../src/session.js';
 import type { RegistryEntry } from '@ccr/shared';
 
 const TS = '2026-10-13T10:00:00.000Z';
@@ -124,23 +124,53 @@ describe('SessionAggregator', () => {
       expect(second.events.filter((e) => e.kind === 'subagent_start')).toHaveLength(0);
     });
 
+    const handBack = line({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c2' }] },
+      toolUseResult: {
+        content: '<agent-message from="agent-abc" from-name="worker">done</agent-message>',
+      },
+    });
+
     it('closes an agent on a hand-back, which is how completion arrives', () => {
       const agg = new SessionAggregator('sess-1');
       agg.ingest(spawnResult);
 
-      const r = agg.ingest(
-        line({
-          type: 'user',
-          message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c2' }] },
-          toolUseResult: {
-            content: '<agent-message from="agent-abc" from-name="worker">done</agent-message>',
-          },
-        }),
-      );
+      const r = agg.ingest(handBack);
 
       const stop = r.events.find((e) => e.kind === 'subagent_stop');
       expect(stop).toBeDefined();
       if (stop?.kind === 'subagent_stop') expect(stop.agentId).toBe('agent-abc');
+    });
+
+    it('closes an agent whose meta was registered before the hand-back', () => {
+      // The case that exposed the inverted condition. `registerSubagentMeta`
+      // seeds the status to 'running', and the old check skipped exactly the
+      // agents that were running — so a hand-back never closed anything and
+      // every subagent stayed 'running' for the life of the session. The test
+      // above passed only because it never registered meta, leaving the status
+      // undefined, which the inverted check happened to let through.
+      const agg = new SessionAggregator('sess-1');
+      agg.ingest(spawnResult);
+      agg.registerSubagentMeta({ agentType: 'Explore', spawnDepth: 1 }, 'agent-abc');
+      expect(agg.subagentTree()[0]!.status).toBe('running');
+
+      agg.ingest(handBack);
+
+      expect(agg.subagentTree()[0]!.status).toBe('completed');
+    });
+
+    it('reports a hand-back once, not on every repeat', () => {
+      const agg = new SessionAggregator('sess-1');
+      agg.ingest(spawnResult);
+      agg.registerSubagentMeta({ agentType: 'Explore', spawnDepth: 1 }, 'agent-abc');
+
+      const first = agg.ingest(handBack);
+      expect(first.events.filter((e) => e.kind === 'subagent_stop')).toHaveLength(1);
+
+      // The completion is idempotent: a repeated hand-back must not re-close it.
+      const second = agg.ingest(handBack);
+      expect(second.events.filter((e) => e.kind === 'subagent_stop')).toHaveLength(0);
     });
 
     it('nests the tree from meta files, not from directory layout', () => {
@@ -215,5 +245,52 @@ describe('SessionAggregator', () => {
 
     agg.ingest(assistantText('hello'));
     expect(agg.idleFor()).toBeLessThan(1_000);
+  });
+});
+
+describe('resumeSeq', () => {
+  it('resumes past the chunker when the persisted value lags it', () => {
+    // The persisted sequence is written on a five-second timer, so events
+    // already in the open chunk can be missing from it. Resuming from the
+    // smaller value would reissue their sequences, and the reader — which
+    // requires a strictly increasing stream — would report a gap and withhold
+    // everything after it.
+    expect(resumeSeq(3, 7)).toBe(8);
+  });
+
+  it('resumes past the persisted value when that is the further along', () => {
+    // A session whose chunks were pruned: the persisted counter is the only
+    // record of how far the stream had got.
+    expect(resumeSeq(10, 7)).toBe(10);
+  });
+
+  it('starts at zero for a session with nothing written', () => {
+    // `lastSeq` is -1 for an empty writer, so this is not an off-by-one.
+    expect(resumeSeq(undefined, -1)).toBe(0);
+  });
+});
+
+describe('advanceLastMainKind', () => {
+  it('records transcript activity', () => {
+    expect(advanceLastMainKind('assistant_text', 'turn_end')).toBe('turn_end');
+  });
+
+  it('leaves a finished turn alone when the title changes', () => {
+    // `ai-title` fires between turns. Letting it answer "what did the session
+    // last do" would erase the `turn_end` the guard is relying on, and refuse a
+    // session that is plainly idle.
+    expect(advanceLastMainKind('turn_end', 'title')).toBe('turn_end');
+  });
+
+  it('does not let the record of a refusal become session activity', () => {
+    // The lockout, in one line: recording a refusal appended an `injection`
+    // event, that event became the last main-thread activity, the session
+    // looked permanently mid-turn, and refusing again appended another.
+    expect(advanceLastMainKind('turn_end', 'injection')).toBe('turn_end');
+    expect(advanceLastMainKind(null, 'injection')).toBeNull();
+  });
+
+  it('ignores an attention note', () => {
+    expect(advanceLastMainKind('turn_end', 'attention')).toBe('turn_end');
   });
 });

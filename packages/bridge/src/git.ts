@@ -140,7 +140,7 @@ export async function ensureClone(options: {
   dir: string;
   branch: string;
 }): Promise<void> {
-  const { dir, branch } = options;
+  const { dir, branch, repoUrl, token } = options;
   await mkdir(dir, { recursive: true });
 
   // `rev-parse` alone is not enough: git searches parent directories, so a
@@ -166,7 +166,7 @@ export async function ensureClone(options: {
       // Upgrading from an earlier version that cloned shallowly. Such a clone
       // cannot push to a repository missing the base objects, so deepen it now
       // rather than discovering that at push time.
-      await unshallowIfNeeded(dir);
+      await unshallowIfNeeded(dir, { repoUrl, token, branch });
 
       return;
     }
@@ -186,7 +186,7 @@ export async function ensureClone(options: {
   // a repository that lacks the base objects, which fails the moment the relay
   // is emptied or recreated. The relay holds only normalized events, so there is
   // nothing worth optimising away.
-  const fetched = await git(['fetch', 'origin', branch], {
+  const fetched = await git(fetchArgs({ repoUrl, token, branch }), {
     cwd: dir,
     bypassProxy: true,
     timeoutMs: 120_000,
@@ -198,17 +198,57 @@ export async function ensureClone(options: {
 }
 
 /**
+ * A `git fetch` that authenticates.
+ *
+ * The credential goes in the URL **argument**, never in the clone's config:
+ * `origin` stays the plain URL, so the token is not left on disk for anything
+ * that can read the working copy to find later. The cost is that the token is
+ * briefly visible in the process table, which on a single-user machine is the
+ * better trade — and it is the same trade `authenticatedUrl` already documents.
+ *
+ * This matters because fetching from `origin` fetches from a *config* URL, and
+ * a config URL has no credential in it. It works on a machine whose credential
+ * manager happens to hold a cached token and fails on a fresh one — the worst
+ * shape a bug can have, because the machine that works is the one that never
+ * tests it.
+ *
+ * The destination refspec is explicit because fetching by URL does not update
+ * `refs/remotes/origin/<branch>`: git only does that for a named remote. It is
+ * forced (`+`) to match the default refspec git would have used, which the
+ * outbound branch needs — every publish amends and force-pushes it, so its
+ * tracked ref is routinely not a fast-forward.
+ */
+export function fetchArgs(options: {
+  repoUrl: string;
+  token: string | null;
+  branch: string;
+}): [command: string, repository: string, refspec: string] {
+  return [
+    'fetch',
+    authenticatedUrl(options.repoUrl, options.token),
+    `+${options.branch}:refs/remotes/origin/${options.branch}`,
+  ];
+}
+
+/**
  * Deepen a shallow clone.
  *
  * A shallow repository cannot be pushed to a remote that lacks the omitted
  * objects — git aborts the push rather than corrupting the history. Recovering
  * in place is cheaper than discarding the clone.
+ *
+ * Takes the credentials for the same reason `fetchArgs` does: this is a fetch,
+ * and a fetch from `origin` carries no credential.
  */
-export async function unshallowIfNeeded(dir: string): Promise<boolean> {
+export async function unshallowIfNeeded(
+  dir: string,
+  remote: { repoUrl: string; token: string | null; branch: string },
+): Promise<boolean> {
   const shallow = await git(['rev-parse', '--is-shallow-repository'], { cwd: dir });
   if (shallow.code !== 0 || shallow.stdout.trim() !== 'true') return false;
 
-  const deepened = await git(['fetch', '--unshallow', 'origin'], {
+  const [, repository, refspec] = fetchArgs(remote);
+  const deepened = await git(['fetch', '--unshallow', repository, refspec], {
     cwd: dir,
     bypassProxy: true,
     timeoutMs: 300_000,

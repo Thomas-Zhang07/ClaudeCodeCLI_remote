@@ -8,13 +8,13 @@
  * an un-fetched prompt with it if the two shared a branch.
  */
 
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { git, gitOrThrow } from '../src/git.js';
+import { ensureClone, fetchArgs, git, gitOrThrow } from '../src/git.js';
 import { RelaySync } from '../src/sync.js';
 
 const OUT = 'relay-out';
@@ -322,6 +322,146 @@ describe('RelaySync', () => {
       expect(existsSync(join(inClone, 'in', '.done'))).toBe(true);
       expect(await readFromRemote('in/.done/sess-1__1700000000-aaa.json')).toContain('hello');
     });
+  });
+
+  describe('recovering a consume whose push failed', () => {
+    /**
+     * Refuse every push, the way a transient failure would.
+     *
+     * A hook on the bare remote rather than a stubbed transport, so the whole
+     * path — commit, push, rejection — is the real one.
+     */
+    async function refusePushes(): Promise<void> {
+      await writeFile(join(remote, 'hooks', 'pre-receive'), '#!/bin/sh\necho refused >&2\nexit 1\n', {
+        mode: 0o755,
+      });
+    }
+
+    async function allowPushes(): Promise<void> {
+      await rm(join(remote, 'hooks', 'pre-receive'), { force: true });
+    }
+
+    it('does not silently ignore prompts written after the failed push', async () => {
+      await phoneWritesPrompt('sess-1', '1700000000-aaa.json', { version: 1, text: 'first' });
+      const sync = await makeSync();
+
+      const first = await sync.listInbound();
+      expect(first).toEqual([join('sess-1', '1700000000-aaa.json')]);
+
+      // The consume is committed locally, and the push carrying it is rejected.
+      await refusePushes();
+      await sync.markConsumed(first);
+      expect(await readFromRemote('in/sess-1/1700000000-aaa.json')).toContain('first');
+      await allowPushes();
+
+      // The phone writes its next prompt on top of the remote head, which the
+      // local clone has now diverged from. `merge --ff-only` can never succeed
+      // again, and ignoring that left the working tree frozen: the prompt was
+      // fetched but never listed, so it was ignored for good.
+      await phoneWritesPrompt('sess-1', '1700000001-bbb.json', { version: 1, text: 'second' });
+
+      const second = await sync.listInbound();
+      expect(second).toEqual([join('sess-1', '1700000001-bbb.json')]);
+
+      // Recovery resets to the remote head before re-applying the moves, so the
+      // prompt we had already run must not come back as one to run again.
+      expect(existsSync(join(inClone, 'in', 'sess-1', '1700000000-aaa.json'))).toBe(false);
+      expect(existsSync(join(inClone, 'in', '.done', 'sess-1__1700000000-aaa.json'))).toBe(true);
+      expect(await readFromRemote('in/.done/sess-1__1700000000-aaa.json')).toContain('first');
+    });
+
+    it('keeps listing prompts it never consumed', async () => {
+      // The other half of the safety property: the reset must not lose a prompt
+      // the bridge had not acted on yet.
+      await phoneWritesPrompt('sess-1', '1700000000-aaa.json', { version: 1, text: 'run me' });
+      await phoneWritesPrompt('sess-1', '1700000001-bbb.json', { version: 1, text: 'and me' });
+
+      const sync = await makeSync();
+      const found = await sync.listInbound();
+      expect(found).toHaveLength(2);
+
+      // Consume only the first, and fail the push that records it.
+      await refusePushes();
+      await sync.markConsumed([found[0]!]);
+      await allowPushes();
+
+      // Divergence is forced by a third prompt landing on the older remote head.
+      await phoneWritesPrompt('sess-1', '1700000002-ccc.json', { version: 1, text: 'third' });
+
+      const after = await sync.listInbound();
+      // The unconsumed one is still there, alongside the new one.
+      expect(after.sort()).toEqual([
+        join('sess-1', '1700000001-bbb.json'),
+        join('sess-1', '1700000002-ccc.json'),
+      ]);
+    });
+  });
+});
+
+describe('fetching with credentials', () => {
+  /**
+   * Observe the URL git actually used.
+   *
+   * `GIT_TRACE` records the command line to a file, which is the only way to
+   * see it without a network. The address is a discard port, so the fetch fails
+   * at once — what is under test is what was attempted.
+   */
+  async function traceOf(run: () => Promise<void>): Promise<string> {
+    const trace = join(root, 'git-trace.log');
+    const previous = process.env['GIT_TRACE'];
+    process.env['GIT_TRACE'] = trace;
+    try {
+      await run();
+    } finally {
+      if (previous === undefined) delete process.env['GIT_TRACE'];
+      else process.env['GIT_TRACE'] = previous;
+    }
+    return readFile(trace, 'utf8');
+  }
+
+  /** Nothing listens here, and it refuses immediately. */
+  const unreachable = 'http://127.0.0.1:9/relay.git';
+
+  it('puts the token in the fetch URL, and never in the clone config', async () => {
+    // Fetching from `origin` uses the configured URL, which deliberately has no
+    // credential in it — so it is anonymous, and only works where a credential
+    // manager happens to hold a cached token. That is the worst shape a bug can
+    // have: it works on the machine that never tests it.
+    const dir = join(root, 'authed-clone');
+    const trace = await traceOf(async () => {
+      await ensureClone({ repoUrl: unreachable, token: 'tok-abc', dir, branch: OUT });
+    });
+
+    expect(trace).toContain('oauth2:tok-abc@127.0.0.1');
+    expect(await readFile(join(dir, '.git', 'config'), 'utf8')).not.toContain('tok-abc');
+  });
+
+  it(
+    'authenticates every fetch the sync layer makes',
+    async () => {
+      const sync = new RelaySync(relayOptions({ repoUrl: unreachable, token: 'tok-abc' }));
+      const trace = await traceOf(async () => {
+        await sync.init();
+        await sync.listInbound();
+      });
+
+      // Both clones, and the inbound refresh. Publish uses the same helper.
+      expect(trace.match(/oauth2:tok-abc@127\.0\.0\.1:9/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    },
+    // Seventeen git processes, each with Windows' spawn cost.
+    30_000,
+  );
+
+  it('never fetches from the bare configured URL', async () => {
+    // The exact command git ran is the only place the two are distinguishable.
+    const args = fetchArgs({ repoUrl: 'https://gitee.com/o/r.git', token: 'tok-abc', branch: OUT });
+    expect(args[0]).toBe('fetch');
+    expect(args[1]).toBe('https://oauth2:tok-abc@gitee.com/o/r.git');
+    // The destination refspec is explicit because fetching by URL does not
+    // update `refs/remotes/origin/<branch>`; forced, because the outbound branch
+    // is force-pushed on every publish.
+    expect(args[2]).toBe(`+${OUT}:refs/remotes/origin/${OUT}`);
+    expect(args).not.toContain('origin');
   });
 });
 

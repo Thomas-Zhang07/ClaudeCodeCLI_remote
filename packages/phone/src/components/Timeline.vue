@@ -2,7 +2,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue';
 
 import { formatDurationMs, parseTs } from '@/lib/format';
-import type { NormalizedEvent } from '@/types';
+import type { EventKind, NormalizedEvent } from '@/types';
 
 import EditCard from './EditCard.vue';
 import MarkdownText from './MarkdownText.vue';
@@ -46,10 +46,24 @@ const limit = ref(PAGE);
 const arriving = ref<number | null>(null);
 let arrivalTimer: ReturnType<typeof setTimeout> | null = null;
 
+/**
+ * Lifecycle entries are *about* an agent, not produced by one.
+ *
+ * On `subagent_start`/`subagent_stop` the `agentId` names the agent the entry
+ * belongs to — see `EventBase` — so filtering on `agentId === null` hid exactly
+ * the two kinds that mark an agent beginning and ending. Spawning and finishing
+ * an agent left no trace on the main roll unless the toggle was on, which is
+ * the opposite of what the main roll is for.
+ */
+const LIFECYCLE_KINDS: ReadonlySet<EventKind> = new Set<EventKind>([
+  'subagent_start',
+  'subagent_stop',
+]);
+
 const visibleEvents = computed<NormalizedEvent[]>(() =>
   showSubagentActivity.value
     ? props.events
-    : props.events.filter((event) => event.agentId === null),
+    : props.events.filter((event) => event.agentId === null || LIFECYCLE_KINDS.has(event.kind)),
 );
 
 const slice = computed(() => visibleEvents.value.slice(-limit.value));

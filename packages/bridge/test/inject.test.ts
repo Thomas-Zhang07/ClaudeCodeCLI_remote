@@ -5,6 +5,7 @@ import {
   PASTE_START,
   injectPrompt,
   injectionRefusal,
+  isFreshSession,
   matchDeliveredTurn,
   splitByBytes,
   type WriteTarget,
@@ -109,6 +110,26 @@ describe('injectionRefusal', () => {
       expect(injectionRefusal({ ...ready, lastMainKind: null, isFresh: false })).toBe(
         'session-not-idle',
       );
+    });
+  });
+
+  describe('isFreshSession', () => {
+    it('is fresh only when nothing has run in the session', () => {
+      expect(isFreshSession(0, 0)).toBe(true);
+    });
+
+    it('is not fresh when the session has recorded anything', () => {
+      expect(isFreshSession(1, 0)).toBe(false);
+    });
+
+    it('is not fresh when the transcript is not empty', () => {
+      // The case the weaker test missed. `recordedSeq === 0` says this bridge
+      // has no record of the session, which is also what a long-running session
+      // looks like once its published chunks are gone — a fresh output
+      // directory, a deleted state file, a relay written elsewhere. Typing a
+      // prompt into such a session lands on whatever is on screen, and if that
+      // is a permission dialog, typing answers it and can approve a tool.
+      expect(isFreshSession(0, 4096)).toBe(false);
     });
   });
 
