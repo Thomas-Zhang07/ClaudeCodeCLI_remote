@@ -52,6 +52,13 @@ export interface BridgeConfig {
   maxSessions: number;
   /** Chunks retained per session, bounding file count rather than bytes. */
   maxChunksPerSession: number;
+  /**
+   * How long without a heartbeat before another bridge may take the lock.
+   *
+   * Detects a live writer regardless of which process started it, which a pid
+   * cannot: an orphaned bridge survives its parent and keeps writing.
+   */
+  lockStaleMs: number;
 
   allowInjection: boolean;
   /** Prompts older than this are refused, bounding the value of a captured file. */
@@ -177,6 +184,7 @@ export function loadConfig(
     retainBytes: num(env['CCR_RETAIN_BYTES'], 10 * 1024 * 1024),
     maxSessions: num(env['CCR_MAX_SESSIONS'], 50),
     maxChunksPerSession: num(env['CCR_MAX_CHUNKS'], 300),
+    lockStaleMs: num(env['CCR_LOCK_STALE_MS'], 20_000),
 
     allowInjection: bool(env['CCR_ALLOW_INJECTION']),
     promptMaxAgeMs: num(env['CCR_PROMPT_MAX_AGE_MS'], 10 * 60 * 1000),

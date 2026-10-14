@@ -116,7 +116,18 @@ range. A range is O(1) however much history exists, which is exactly what a
 listing could not be. Retention (rolling ~10 MB per session, oldest chunk
 deleted) bounds the relay itself. See `docs/RELAY-DESIGN.md`.
 
-### 19. An orphaned bridge can survive its parent, and two writers corrupt quietly
+### 19. ~~An orphaned bridge can survive its parent~~ — RESOLVED
+
+**Resolved** by replacing the pid lock with a **heartbeat**. The holder refreshes
+a timestamp; a newcomer refuses while that timestamp is fresh, which detects a
+live writer regardless of which process started it. A pid cannot: an orphaned
+bridge outlives the parent whose pid the old lock recorded, so a stale lock was
+taken over while the orphan was still writing.
+
+Verified: a lock 60 seconds old is taken over with a note naming the previous
+holder; a fresh one is refused with how long ago it was last seen.
+
+<details><summary>Original report</summary>
 
 Observed for real: two bridges ran at once against one state directory, one
 holding stale code. They interleaved writes to the same chunk files, so some
@@ -134,6 +145,8 @@ detects a live writer regardless of which pid started it.
 
 **Status:** open. Practical mitigation is to run one bridge and check for strays
 before starting another.
+
+</details>
 
 ### 17. The reader's cache is smaller than the retention window
 
