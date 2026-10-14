@@ -52,19 +52,49 @@ events than the cap allows. So the ceiling is unlikely ever to be reached.
 **Status:** read path proven at realistic sizes; the 256 KB cap itself remains
 untested. Revisit only if a session ever produces a chunk near it.
 
-### 20. Corrupt-manifest recovery loses the sequence position
+### 20. ~~Corrupt-manifest recovery loses the sequence position~~ — RESOLVED
 
-When the chunker's manifest is unreadable it now starts numbering above the
-existing chunk files rather than overwriting them — but its in-memory sealed
-list is empty afterwards, so the sequence position falls back to the persisted
-value, which may sit behind chunks still on disk.
+When the chunker's manifest is unreadable it starts numbering above the existing
+chunk files rather than overwriting them — but its in-memory sealed list was left
+empty, so the sequence position fell back to the persisted value, which may sit
+behind chunks still on disk. Those chunks stopped being advertised, and a reader
+never assembled them with new events.
 
-Those chunks stop being advertised (`chunkFirst` jumps above them), so a reader
-never assembles them with new events. Nothing is corrupted or lost on the
-bridge, but a phone holding them cached will not see them again either.
+**Resolved** by rebuilding the sealed list from the chunk files themselves. A
+chunk is vouched for only when its terminating sentinel parses, its `n` matches
+the filename, its line count matches the events actually present, and its `crc32`
+covers the sequence and count taken from its own body — the same rule `seal()`
+writes by. `lastSeq` now continues from what is on disk, which is the symptom the
+issue was named for.
 
-**Status:** open. Rebuilding the sealed list by scanning the chunk files would
-fix it properly; larger than the fix that introduced the compromise.
+Recovery keeps a **contiguous run from the newest chunk downwards** and starts
+the advertised range above the first chunk it cannot vouch for. That direction is
+forced by the reader rather than chosen: the phone walks `chunkFirst..chunkLast`
+in order and stops at the first chunk it cannot read, so a hole *inside* the
+advertised range would hide every chunk above it — including the newest, which is
+the one that matters. Keeping the trustworthy chunks below the break would
+necessarily publish a range spanning it, which is the same whole-session outage
+this codebase has now had to fix twice.
+
+Two consequences, both deliberate:
+
+- A chunk that cannot be vouched for is left on disk untouched — deleting it is
+  not the writer's call, and it is the only copy of those events — but it is no
+  longer inside retention's view, so it will not be pruned. A few stale files are
+  a better trade than a permanently stranded reader.
+- `droppedEvents` is published as a **provable lower bound** (`#chunk - 1 -
+  #sealed.length`) rather than 0. The manifest was the only record of how many
+  events retention deleted, so the true count is genuinely gone — and 0 is not
+  the neutral answer: it is a claim of completeness the files refute, and it also
+  suppresses the phone's "the relay keeps a rolling window" note for a timeline
+  that visibly starts partway through. The bound understates the magnitude but
+  never overstates it.
+
+**Left alone deliberately:** the branch for "chunk files on disk with no manifest
+at all" assumes a crash before the first seal, so it keeps `#chunk` at 1 and
+resumes that chunk. If the manifest were ever *deleted* while sealed chunks were
+on disk, that would weld new events onto a sealed file. Two existing tests depend
+on the resume-chunk-1 behaviour, so it is not a drive-by fix.
 
 ### 21. The event-size ceiling is now enforced rather than documented
 
@@ -119,6 +149,26 @@ this is a gap rather than a bug.
 **Status:** open, accepted. Worth revisiting if a producer is ever added outside
 `#tickSession`, `#recordInjection` and `#recordAttention`, which are the three
 that hold the queue today.
+
+### 24. No test file is typechecked
+
+Both package tsconfigs include only `src/**/*.ts` — `packages/shared` excludes
+tests explicitly — so `tsc --noEmit` never sees a test. The suite still runs,
+because vitest transpiles without checking types, which means an error that
+exists only in a test is invisible to every command this repository has.
+
+Found while adding the wire-format fixture: `packages/bridge/test/chunker.test.ts`
+calls `w.finish(state())` in four places and `ChunkWriter.finish()` takes no
+parameters. That has presumably been wrong since the signature changed, and
+nothing noticed.
+
+Every test added in this round — the queue's, the lock's, the fixture's, the
+chunker recovery's — sits inside the same blind spot.
+
+**Status:** open. The fix is a `tsconfig.test.json` per package including
+`test/**/*.ts`, wired into that package's `typecheck` script. Small, but it will
+surface whatever else has accumulated, so it wants to be its own change rather
+than a drive-by.
 
 ### 4. ~~Inbound prompts are never consumed~~ — RESOLVED
 
@@ -265,8 +315,47 @@ updated**, so every chunk would have failed validation.
 
 The stronger check in practice is `sentinel.lines === events.length`.
 
-**Status:** formats verified matching. Worth a shared fixture if either side
-changes again.
+**Now pinned by a fixture — but only on the writer's side.**
+`packages/shared/test/fixtures/events-0001.jsonl` is a complete, sealed chunk file
+exactly as it appears on disk: three events, then the terminating sentinel. It
+holds the cases that are easy to get wrong on one side only — a CJK `text` that
+must stay literal UTF-8 rather than be escaped, and one carrying a quote, a
+newline and a backslash — and its first event is sequence **0**, the value the
+writer once mistook for "unset" and signed over the second event instead.
+It was composed by hand and the writer was then confirmed to reproduce it, not
+captured from the writer: it states the format rather than describing one
+implementation of it. (Its LF endings are part of the assertion; the root
+`.gitattributes` pinning `eol=lf` is what keeps a checkout from converting them.)
+
+Two tests consume it:
+
+- `packages/shared/test/chunk-format.test.ts` checks the fixture against the
+  format: the sentinel is the last line, `lines` equals the number of event
+  lines, and `crc32` equals a CRC-32 computed over `` `${firstSeq}:${lines}` ``
+  with `firstSeq` taken from the first event. The CRC is written out in the test
+  rather than imported, so it cannot agree with the bridge merely by sharing its
+  code.
+- `packages/bridge/test/chunk-format.test.ts` runs a real `ChunkWriter` over the
+  same events and asserts `events-0001.jsonl` is **byte-identical** to the
+  fixture.
+
+The writer can therefore no longer drift from the format without a test failing
+in the package that drifted. That is the protection this issue was missing: the
+two implementations now meet at one artefact instead of agreeing by convention.
+
+**What is still convention: the reader.** The phone's `parseChunk` is *not*
+asserted against the fixture, and cannot be — `packages/phone` is not a workspace,
+has no test runner, and resolves its imports through `@/*` aliases, so nothing
+outside a bundler can load it (issue 22). A change to the reader's checksum input
+still fails no test; it fails on a phone, as an empty timeline, which is precisely
+how this bug arrived the first time. Do not read the fixture's existence as
+covering that half.
+
+**Status:** the writer is pinned byte-exact; the reader is unverified against the
+fixture. Whoever fixes 22 should make `parseChunk` the fixture's third consumer —
+that is the test this issue actually wants. Until then, a change to the format
+means editing the fixture, the writer and `packages/phone/src/lib/events.ts`
+together, by hand.
 
 ### 15. Publishing on turn boundaries means no live streaming
 
