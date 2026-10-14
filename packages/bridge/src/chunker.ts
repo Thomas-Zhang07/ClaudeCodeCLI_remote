@@ -393,6 +393,44 @@ export class ChunkWriter {
     await this.#persistManifest();
   }
 
+  /**
+   * The kind of the last main-thread event already written for this session.
+   *
+   * Read at startup when no persisted value exists, so the injection guard has
+   * an answer immediately rather than after the session next happens to emit
+   * something. Without this, a bridge restarted while a session is idle reads
+   * nothing new — the tailer is already at the end — so the guard sees "unknown"
+   * and refuses every prompt indefinitely.
+   *
+   * Scans the newest chunk first, falling back to earlier ones, because a chunk
+   * containing only subagent events has no main-thread event to report.
+   */
+  async readLastMainKind(): Promise<string | null> {
+    const newestFirst = [this.#chunk, ...this.#sealed.map((c) => c.n).reverse()];
+
+    for (const n of newestFirst) {
+      const path = join(this.#dir, chunkFilename(n));
+      if (!existsSync(path)) continue;
+
+      const lines = (await readFile(path, 'utf8')).split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]?.trim();
+        if (!line) continue;
+
+        let parsed: { kind?: unknown; agentId?: unknown; t?: unknown };
+        try {
+          parsed = JSON.parse(line) as typeof parsed;
+        } catch {
+          continue; // A torn final line from an unclean shutdown.
+        }
+        if (parsed.t === 'chunk_end') continue;
+        if (parsed.agentId === null && typeof parsed.kind === 'string') return parsed.kind;
+      }
+    }
+
+    return null;
+  }
+
   /** Total bytes on disk for this session, for diagnostics. */
   async diskBytes(): Promise<number> {
     let total = 0;

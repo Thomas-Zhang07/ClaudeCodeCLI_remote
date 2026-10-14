@@ -623,8 +623,11 @@ export class Bridge {
       lastAgentScan: 0,
       // Restored rather than started null: the guard depends on it, and a
       // session idle since before this process began would otherwise look
-      // permanently busy.
-      lastMainKind: saved?.lastMainKind ?? null,
+      // permanently busy. When nothing was persisted — an upgrade, or state
+      // lost — it is recovered from the events already on disk rather than
+      // waited for, since waiting means refusing every prompt until the session
+      // happens to emit something on its own.
+      lastMainKind: saved?.lastMainKind ?? (await chunker.readLastMainKind()),
     });
   }
 

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -123,6 +123,87 @@ describe('ChunkWriter', () => {
     for (let i = 1; i < chunks.length; i++) {
       expect(chunks[i]!.firstSeq).toBe(chunks[i - 1]!.lastSeq + 1);
     }
+  });
+
+  describe('readLastMainKind', () => {
+    const withAgent = (seq: number, kind: string, agentId: string | null): NormalizedEvent => ({
+      ...event(seq),
+      kind: 'assistant_text',
+      agentId,
+      ...(kind === 'assistant_text' ? {} : {}),
+    });
+
+    it('returns the kind of the last main-thread event', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append(event(0));
+      await w.append({ ...event(1), kind: 'turn_end' });
+      await w.finish();
+
+      expect(await w.readLastMainKind()).toBe('turn_end');
+    });
+
+    it('ignores subagent events, which arrive on their own schedule', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append({ ...event(0), kind: 'turn_end' });
+      await w.append({ ...event(1), kind: 'assistant_text', agentId: 'agent-x' });
+      await w.finish();
+
+      // The subagent spoke last, but the main thread is what matters.
+      expect(await w.readLastMainKind()).toBe('turn_end');
+    });
+
+    it('reports the last event, not the sentinel that follows it', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append(event(0));
+      await w.finish();
+
+      // The helper's default kind; the point is that the sentinel is skipped
+      // rather than reported as the last thing that happened.
+      expect(await w.readLastMainKind()).toBe('assistant_text');
+    });
+
+    it('returns null for a session with nothing recorded', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      expect(await w.readLastMainKind()).toBeNull();
+    });
+
+    it('looks past a chunk holding only subagent events', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await w.open('sess-1');
+      await w.append({ ...event(0), kind: 'turn_end' });
+      await w.append({ ...event(1), kind: 'assistant_text', agentId: 'a', text: 'x'.repeat(90) });
+      await w.finish();
+
+      expect(await w.readLastMainKind()).toBe('turn_end');
+    });
+
+    it('survives a torn final line', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append({ ...event(0), kind: 'turn_end' });
+      await w.finish();
+
+      // A crash mid-write leaves a partial line behind.
+      await appendFile(join(dir, chunkFilename(1)), '{"kind":"assist');
+
+      expect(await w.readLastMainKind()).toBe('turn_end');
+    });
+
+    it('recovers the value after a restart, with no persisted state', async () => {
+      const first = new ChunkWriter({ dir });
+      await first.open('sess-1');
+      await first.append({ ...event(0), kind: 'turn_end' });
+      await first.finish();
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+
+      expect(await second.readLastMainKind()).toBe('turn_end');
+    });
   });
 
   it('reports a chunk range the reader can trust', async () => {
