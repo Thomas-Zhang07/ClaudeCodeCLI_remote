@@ -74,18 +74,21 @@ const phaseLabel = computed(() => {
 });
 
 /**
- * Two tones, and only two. A recorder is either bringing in the record or it is
- * not; which of the several ways it is failing belongs in the sentence beside
- * the mark.
+ * Fault is reserved for things that are actually wrong: the relay answered with
+ * an error, or we are being throttled. Those the phone knows.
  *
- * A stale PC is a fault for that reason: the record is not coming in. It is
- * deliberately *not* the same signal as `offline` — Gitee answered, so the
- * phone is on the network and the relay is reachable, and the sentence beside
- * the mark says which of the two is missing.
+ * A quiet PC is *not* one of them, however long the silence. Publishing is
+ * event-driven — a turn boundary, a session blocking, a prompt being injected —
+ * so a healthy bridge is legitimately silent through a single long turn, and no
+ * threshold separates that from a bridge that has died. The phone cannot tell
+ * those apart, so it reports when the PC last published and lets the reader
+ * judge, rather than colouring a fact as a verdict. It is still deliberately
+ * distinct from `offline`: Gitee answered, so the network and the relay are
+ * known to be fine, and the sentence says which part is missing.
  */
 const tone = computed(() => {
   if (isThrottled.value || relay.phase === 'error') return 'fault';
-  if (relay.phase === 'ready') return isStale.value ? 'fault' : 'ok';
+  if (relay.phase === 'ready') return isStale.value ? 'neutral' : 'ok';
   return 'neutral';
 });
 

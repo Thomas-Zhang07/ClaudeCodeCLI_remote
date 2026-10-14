@@ -52,7 +52,43 @@ events than the cap allows. So the ceiling is unlikely ever to be reached.
 **Status:** read path proven at realistic sizes; the 256 KB cap itself remains
 untested. Revisit only if a session ever produces a chunk near it.
 
-### 4. Inbound prompts are never consumed
+### 20. Corrupt-manifest recovery loses the sequence position
+
+When the chunker's manifest is unreadable it now starts numbering above the
+existing chunk files rather than overwriting them — but its in-memory sealed
+list is empty afterwards, so the sequence position falls back to the persisted
+value, which may sit behind chunks still on disk.
+
+Those chunks stop being advertised (`chunkFirst` jumps above them), so a reader
+never assembles them with new events. Nothing is corrupted or lost on the
+bridge, but a phone holding them cached will not see them again either.
+
+**Status:** open. Rebuilding the sealed list by scanning the chunk files would
+fix it properly; larger than the fix that introduced the compromise.
+
+### 21. The event-size ceiling is now enforced rather than documented
+
+`MAX_EVENT_BYTES` was described as asserted by the chunk writer but never
+checked; it is now checked before any state moves, so a rejection leaves the
+chunk untouched and is logged rather than silent.
+
+**Residual risk:** JSON escaping expands bounded strings, so a pathological
+payload of control characters could in principle reach the ceiling. Measured
+against 47 real chunks the largest event is 12.9 KB against a 20 KB bound, so it
+is unreachable for real content — but it is a new runtime failure mode where a
+documented bound previously was.
+
+### 22. The phone package has no test runner
+
+`packages/phone` is a standalone package with its own lockfile and no test
+script. Its five fixes from the review are covered by typecheck and build only.
+The one with logic shared with the bridge — the liveness heartbeat contract — is
+covered from the bridge side.
+
+**Status:** accepted gap. Adding vitest there means touching its lockfile, which
+was judged a worse trade than the gap.
+
+### 4. ~~Inbound prompts are never consumed~~ — RESOLVED
 
 `#pollInbound` verifies prompts and records the outcome, but does not move them
 to `in/.done/`. Injection needs the `ccr` wrapper (M6), and consuming a prompt we
@@ -60,6 +96,11 @@ cannot deliver would lose it silently.
 
 **Consequence:** `in/` accumulates. A `seenPrompts` set prevents re-reporting,
 so this is untidy rather than harmful — until M6 lands.
+
+**Resolved:** `#pollInbound` now delivers and calls `markConsumed`, which moves
+the file to `in/.done/`. A `seenPrompts` set remains as a safety net. The
+inbound fetch also recovers from a failed push rather than wedging — see the
+note under issue 3.
 
 ### 5. ~~One commit per publish, with no compaction~~ — RESOLVED
 
