@@ -104,6 +104,21 @@ export interface SessionHead {
   retainedBytes: number;
   /** Events dropped by rolling retention, so the reader can say so plainly. */
   droppedEvents: number;
+  /**
+   * Which series of chunks these numbers belong to.
+   *
+   * A chunk *number* is only meaningful within a generation: rebuilding the
+   * bridge's output directory restarts the numbering at chunk 1, so
+   * `events-0001.jsonl` can hold a different set of events under the same name.
+   * The cache key must therefore include this token, or a cached chunk from a
+   * previous generation is served as though it were the current one.
+   *
+   * Absent on a head published by a bridge too old to carry it, and **absent
+   * means "assume it matches"** — the only way to keep such a bridge readable.
+   * That is the weaker path: it is exactly the stale-cache hazard above, and it
+   * exists for compatibility, nothing else.
+   */
+  generation?: string;
 }
 
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'stopped';

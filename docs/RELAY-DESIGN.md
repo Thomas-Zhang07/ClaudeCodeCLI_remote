@@ -45,6 +45,18 @@ out/sessions/<id>/events-NNNN.jsonl  immutable chunks, rolling retention
 out/sessions/<id>/subagents.json     metadata-only subagent forest
 ```
 
+**`head.json` carries a chunk-series generation.** Chunk numbers are immutable
+*within a series*, but the series itself can be rebuilt — clearing the output
+directory, or a session cold-starting — and then `events-0001.jsonl` holds
+different events under the same name. A reader caching by path alone served the
+old bytes and reported a stream gap in data that was verified contiguous. The
+generation is an opaque token minted when the writer creates a session's output
+directory and persisted with its bookkeeping, so it survives a restart and
+changes on a rebuild and nothing else. The reader includes it in its cache key
+and drops the previous generation's entries, which are dead weight. The field is
+optional on the wire, and **absent means "assume it matches"** — that keeps an
+older bridge readable at the cost of the protection the token exists to give.
+
 **Two files rather than one** because they change at different rates and are read
 at different times. The session list is loaded once when browsing; `head.json` is
 polled only while a session is actually open.
@@ -97,6 +109,12 @@ Two hazards are handled explicitly:
 - **A burst after the phone wakes.** Background tabs are frozen, so a phone that
   slept through a long run finds many missing chunks at once. They are fetched
   gradually; requesting them all immediately is what trips a `429`.
+
+A sequence discontinuity is only reported as a hole once the whole retained
+range has been read. While chunks it has not fetched are outstanding, the reader
+says "catching up": a gap it has not yet had the chance to disprove is not the
+same finding as one it has, and "torn" is a claim about the record that a reader
+which is merely behind has no standing to make.
 
 ## Constraints this design works within
 

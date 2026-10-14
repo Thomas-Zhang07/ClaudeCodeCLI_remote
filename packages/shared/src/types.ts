@@ -251,6 +251,26 @@ export interface SessionHead extends SessionState {
   retainedBytes: number;
   /** Events dropped by retention, so the reader can say so plainly. */
   droppedEvents: number;
+  /**
+   * Identifies this run of a session's chunk series.
+   *
+   * Chunk *numbers* are not stable across a rebuild: clearing the output
+   * directory restarts the series at chunk 1, so `events-0001.jsonl` can go from
+   * holding 398 events to holding 49 while keeping its name. A reader that
+   * caches by path then serves the old bytes under a key that never changed, and
+   * reports a stream gap that does not exist.
+   *
+   * So a cached chunk is only valid within the generation it was fetched from.
+   * The token is opaque, minted when the writer first creates a session's output
+   * directory, and stable for as long as that series of chunks lives — it
+   * changes on a rebuild and on nothing else.
+   *
+   * Optional on the wire, and **absent means "assume it matches"**: a reader
+   * must keep working against a bridge too old to publish it. That fallback is
+   * the weaker path — it is exactly the stale-cache hazard above — and exists
+   * only for compatibility.
+   */
+  generation?: string;
 }
 
 export interface CostState {

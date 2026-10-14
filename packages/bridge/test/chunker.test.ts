@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -413,6 +413,146 @@ describe('ChunkWriter', () => {
 
       expect(w.range.chunkFirst).toBe(1);
       expect(w.range.droppedEvents).toBe(0);
+    });
+  });
+
+  /**
+   * The generation token is what tells a reader that `events-0001.jsonl` no
+   * longer means what it meant when it was cached. Both directions matter, and
+   * both are proved here:
+   *
+   *  - **Stable across an ordinary restart**, or every bridge restart would
+   *    discard every phone's cache for every session.
+   *  - **Different after a rebuild**, or the reader keeps serving the old bytes
+   *    under a name that never changed — the bug that produced a "stream gap"
+   *    in data that was verified contiguous.
+   */
+  describe('generation', () => {
+    it('does not change across an ordinary restart, so the series continues', async () => {
+      const first = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await first.open('sess-1');
+      for (let i = 1; i <= 12; i++) await first.append(event(i, 60));
+      await first.finish();
+      const minted = first.generation;
+      expect(minted).not.toBe('');
+
+      // A restart: new process, same directory, same manifest.
+      const second = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await second.open('sess-1');
+
+      expect(second.generation).toBe(minted);
+      // Not merely equal by accident of reuse — it is on disk, so the next
+      // restart finds it too.
+      expect(JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')).generation).toBe(minted);
+    });
+
+    it('does not change when the writer seals again after a restart', async () => {
+      const first = new ChunkWriter({ dir });
+      await first.open('sess-1');
+      await first.append(event(1));
+      await first.finish();
+      const minted = first.generation;
+
+      const second = new ChunkWriter({ dir });
+      await second.open('sess-1');
+      await second.append(event(2));
+      await second.finish();
+
+      expect(second.generation).toBe(minted);
+      // And a third open still finds the same one, so it is not being re-minted
+      // by every seal.
+      const third = new ChunkWriter({ dir });
+      await third.open('sess-1');
+      expect(third.generation).toBe(minted);
+    });
+
+    it('changes when the output directory is rebuilt from scratch', async () => {
+      const first = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await first.open('sess-1');
+      for (let i = 1; i <= 12; i++) await first.append(event(i, 60));
+      await first.finish();
+      const before = first.generation;
+
+      await rm(dir, { recursive: true, force: true });
+
+      const second = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await second.open('sess-1');
+
+      expect(second.generation).not.toBe(before);
+      // The rebuild restarts the numbering, which is exactly why the token has
+      // to move with it.
+      expect(second.chunkNumber).toBe(1);
+    });
+
+    it('changes when the output is cleared but the manifest survives it', async () => {
+      // The observed failure: the bookkeeping lives *outside* the published
+      // tree, so clearing `.ccr-state/out` leaves a manifest describing chunks
+      // that no longer exist. Keeping its token would leave every reader
+      // trusting cached bytes for a series that has been replaced.
+      const stateDir = await mkdtemp(join(tmpdir(), 'ccr-state-'));
+      const manifestPath = join(stateDir, 'sess-1.json');
+
+      const first = new ChunkWriter({ dir, manifestPath, maxChunkBytes: 120 });
+      await first.open('sess-1');
+      for (let i = 1; i <= 12; i++) await first.append(event(i, 60));
+      await first.finish();
+      const before = first.generation;
+      expect(existsSync(manifestPath)).toBe(true);
+
+      await rm(dir, { recursive: true, force: true });
+
+      const second = new ChunkWriter({ dir, manifestPath, maxChunkBytes: 120 });
+      await second.open('sess-1');
+
+      expect(second.generation).not.toBe(before);
+      expect(second.chunkNumber).toBe(1);
+      // The stale manifest is not merely ignored — the next seal replaces it.
+      await second.append(event(1, 60));
+      await second.finish();
+      expect(JSON.parse(await readFile(manifestPath, 'utf8')).generation).toBe(second.generation);
+    });
+
+    it('is carried into the range the reader is told about', async () => {
+      const w = new ChunkWriter({ dir });
+      await w.open('sess-1');
+      await w.append(event(1));
+      await w.finish();
+
+      expect(w.range.generation).toBe(w.generation);
+      expect(w.range.generation).not.toBe('');
+    });
+
+    it('differs between sessions', async () => {
+      const other = await mkdtemp(join(tmpdir(), 'ccr-chunk-'));
+      const a = new ChunkWriter({ dir });
+      const b = new ChunkWriter({ dir: other });
+      await a.open('sess-1');
+      await b.open('sess-2');
+
+      expect(a.generation).not.toBe(b.generation);
+    });
+
+    it('mints one for a manifest written before generations existed, then keeps it', async () => {
+      // An upgrade must not leave a session on the unguarded path forever, but
+      // it must also not re-mint on every open: one invalidation, then stable.
+      const published = new ChunkWriter({ dir });
+      await published.open('sess-1');
+      await published.append(event(1));
+      await published.finish();
+
+      const legacy = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'));
+      delete legacy.generation;
+      await writeFile(join(dir, 'manifest.json'), JSON.stringify(legacy));
+
+      const upgraded = new ChunkWriter({ dir });
+      await upgraded.open('sess-1');
+      const minted = upgraded.generation;
+      expect(minted).not.toBe('');
+      await upgraded.finish();
+
+      const next = new ChunkWriter({ dir });
+      await next.open('sess-1');
+      expect(next.generation).toBe(minted);
     });
   });
 

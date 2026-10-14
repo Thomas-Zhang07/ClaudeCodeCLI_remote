@@ -1,11 +1,18 @@
 /**
- * Chunk cache, keyed by repository path.
+ * Chunk cache, keyed by repository path plus the session's generation.
  *
  * It now holds only sealed event chunks, and that makes caching simple: a chunk
  * is immutable once written, so a cached chunk is never stale and never needs
- * revalidating. Its path alone is the key — the sha argument exists for callers
- * that do have one (and pass `''` when they do not). Not fetching a chunk we
- * already hold is the whole point of the numbered-chunk layout.
+ * revalidating. The path is the key — the sha argument exists for callers that
+ * do have one (and pass `''` when they do not) — but the path *alone* is not
+ * enough. A chunk number only means something within a generation: rebuilding
+ * the bridge's output restarts the numbering at chunk 1, so
+ * `events-0001.jsonl` can hold different events under the same name, and a
+ * reader keyed by path alone served the old bytes and reported a stream gap that
+ * did not exist. Keys are therefore `<session dir>/<generation>/events-NNNN.jsonl`,
+ * and {@link BlobCache.evictExcept} retires a whole previous generation.
+ * Not fetching a chunk we already hold is the whole point of the numbered-chunk
+ * layout.
  *
  * Entries are written to localStorage so reopening the PWA paints from the last
  * known state instead of from an empty screen.
@@ -116,6 +123,38 @@ export class BlobCache {
     this.#bytes = 0;
     this.#dirty = true;
     this.flush();
+  }
+
+  /**
+   * Drop every entry under `prefix` that is not under `keepPrefix`.
+   *
+   * Used to retire a session's previous chunk generation in one pass. The
+   * alternative — remembering which generation we last loaded and deleting that
+   * one specifically — does not survive a reload: the entries live in
+   * localStorage, the memory of them does not. Sweeping by shape instead means a
+   * phone that has been closed since before a rebuild still clears the dead
+   * entries the first time it reads the new head.
+   *
+   * Returns how many entries were dropped. Both prefixes must be non-empty; an
+   * empty `keepPrefix` would match nothing worth keeping, so it is refused
+   * rather than allowed to empty the cache.
+   */
+  evictExcept(prefix: string, keepPrefix: string): number {
+    if (prefix === '' || keepPrefix === '') return 0;
+
+    let dropped = 0;
+    for (const [key, entry] of [...this.#entries]) {
+      if (!key.startsWith(prefix) || key.startsWith(keepPrefix)) continue;
+      this.#entries.delete(key);
+      this.#bytes -= entry.text.length;
+      dropped += 1;
+    }
+
+    if (dropped > 0) {
+      this.#dirty = true;
+      this.#schedule();
+    }
+    return dropped;
   }
 
   /** Force a synchronous write. Also called when the tab is hidden. */

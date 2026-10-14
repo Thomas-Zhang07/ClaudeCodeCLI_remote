@@ -202,8 +202,42 @@ function delay(ms: number): Promise<void> {
 }
 
 /** `events-` + the number zero-padded to four digits + `.jsonl`. */
+function chunkFile(n: number): string {
+  return `events-${String(n).padStart(4, '0')}.jsonl`;
+}
+
+/** Where a chunk lives in the relay. */
 function chunkPath(sessionId: string, n: number): string {
-  return `out/sessions/${sessionId}/events-${String(n).padStart(4, '0')}.jsonl`;
+  return `out/sessions/${sessionId}/${chunkFile(n)}`;
+}
+
+/**
+ * Where a fetched chunk is cached.
+ *
+ * The generation is part of the key because a chunk *number* is only meaningful
+ * within one. Rebuilding the bridge's output restarts the numbering at chunk 1,
+ * so `events-0001.jsonl` can hold 49 events where it held 398 — and a cache
+ * keyed by path alone kept serving the old bytes, which the assembler then read
+ * as a stream gap in data that was verified contiguous.
+ *
+ * An absent generation falls back to the bare path, which is the *weaker* path:
+ * such a cache is not protected against a rebuild at all. It is kept only so a
+ * head published by an older bridge — which carries no token — stays readable.
+ */
+function chunkCacheKey(sessionId: string, generation: string | undefined, n: number): string {
+  return generation === undefined
+    ? chunkPath(sessionId, n)
+    : `out/sessions/${sessionId}/${generation}/${chunkFile(n)}`;
+}
+
+/**
+ * The head's generation, or undefined when it carries none.
+ *
+ * Empty is treated as absent: it is what a writer would publish if it had
+ * nothing to say, and assuming it matches is the compatibility path above.
+ */
+function headGeneration(head: SessionHead): string | undefined {
+  return typeof head.generation === 'string' && head.generation !== '' ? head.generation : undefined;
 }
 
 export function sessionDir(sessionId: string): string {
@@ -479,6 +513,18 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
     detail.head = head;
     relay.heads[sessionId] = head;
 
+    // --- the generation ---------------------------------------------------
+    const generation = headGeneration(head);
+
+    // A rebuilt series makes every cached chunk of the previous one
+    // unreachable: same names, different contents. Evict them here rather than
+    // leaving them to age out — nothing will ever read them again, and a phone
+    // that has been closed since before the rebuild has no memory of the old
+    // token to delete it by.
+    if (generation !== undefined) {
+      blobCache.evictExcept(`${dir}/`, `${dir}/${generation}/`);
+    }
+
     // --- an empty range means the session has recorded nothing ------------
     if (head.chunkLast < head.chunkFirst) {
       applyEmpty(detail);
@@ -493,11 +539,12 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
 
     for (let n = head.chunkFirst; n <= head.chunkLast; n++) {
       const path = chunkPath(sessionId, n);
+      const cacheKey = chunkCacheKey(sessionId, generation, n);
       const mustRefetch = detail.resyncFrom !== null && n >= detail.resyncFrom;
 
-      // A sealed chunk is immutable, so its path alone is a valid cache key;
-      // reusing one is the entire point of numbering chunks.
-      let text = mustRefetch ? null : blobCache.get(path, '');
+      // A sealed chunk of a given generation is immutable, so its cache key is
+      // valid indefinitely; reusing one is the entire point of numbering chunks.
+      let text = mustRefetch ? null : blobCache.get(cacheKey, '');
       let sha = '';
       let justFetched = false;
 
@@ -535,7 +582,7 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       // Cache only a complete, self-consistent chunk: a chunk without a
       // sentinel will change, and the cache assumes chunks are immutable.
       if (justFetched) {
-        blobCache.set(path, sha, text);
+        blobCache.set(cacheKey, sha, text);
         fetchedNew = true;
       }
       loaded.push({ n, events: parsed.events });
@@ -581,8 +628,25 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       inFlight = blocked !== null;
     }
 
+    // A jump in the sequence is only a hole when the reader has what it asked
+    // for. While chunks remain unfetched — a catch-up after the phone slept, a
+    // just-pushed chunk the Contents API has not caught up with — their absence
+    // is the competing explanation, and the honest word is "catching up", not
+    // "torn". A torn strip is a claim about the record; a reader that has simply
+    // not finished fetching has no standing to make it.
+    //
+    // An unsealed newest chunk is deliberately *not* one of these cases: it
+    // means everything sealed has been loaded, so a jump there is real damage
+    // and must be reported.
+    const catchingUp =
+      blocked !== null && (blocked.kind === 'deferred' || blocked.kind === 'unavailable');
+
     const assembled: Assembled = assembleStream(loaded);
-    if (assembled.gapAfterSeq !== null && gap === null) {
+    // Withheld here, not forgotten: a jump in a range we have not finished
+    // fetching is re-tested on every poll, and becomes the fault above as soon
+    // as the range is complete.
+    const gapWithheld = catchingUp && assembled.gapAfterSeq !== null;
+    if (assembled.gapAfterSeq !== null && gap === null && !catchingUp) {
       gap = { afterSeq: assembled.gapAfterSeq, reason: 'sequence-gap' };
     }
 
@@ -608,7 +672,12 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
     // `keptPrevious` is the case that most needs the sentence: nothing loaded,
     // so the roll above is holding older events. Without it that case would be
     // the one that stayed silent whenever the session has a single chunk.
-    detail.inFlight = !resyncing && (keptPrevious || (inFlight && pending.length > 1));
+    //
+    // `gapWithheld` is the other: the timeline stops where the sequence jumped,
+    // and a fault about it is being withheld — so the reader must be told why
+    // the strip ends early rather than left to wonder.
+    detail.inFlight =
+      !resyncing && (keptPrevious || gapWithheld || (inFlight && pending.length > 1));
     detail.pendingChunks = pending;
     detail.chunksLoaded = loaded.length;
     detail.chunksTotal = head.chunkLast - head.chunkFirst + 1;

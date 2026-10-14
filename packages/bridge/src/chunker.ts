@@ -13,9 +13,17 @@
  *    file trimmed from the front would be rewritten on every pass, and a
  *    rewritten file can never be cached by the reader — which is the whole
  *    reason chunks are chunked. Deleting keeps every survivor immutable.
+ *  - **A chunk number only means something within a generation.** Immutability
+ *    holds for as long as a series lives, but the series itself can be rebuilt:
+ *    clearing the output directory restarts the numbering, so
+ *    `events-0001.jsonl` can go from 398 events to 49 under the same name. The
+ *    reader caches by path, so it kept serving the old bytes and reported a
+ *    stream gap that did not exist. Every session therefore carries an opaque
+ *    {@link generation} that changes when — and only when — the series is
+ *    rebuilt, and the reader keys its cache by it.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rename, rm, stat, truncate, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -45,6 +53,23 @@ export interface ChunkRange {
   lastSeq: number;
   retainedBytes: number;
   droppedEvents: number;
+  /** Identifies the run of chunks these numbers belong to. See the file header. */
+  generation: string;
+}
+
+/**
+ * A new series token.
+ *
+ * Deliberately short — 8 random bytes, hex — because it travels in `head.json`,
+ * which is polled every few seconds. It is not ordered and carries no meaning:
+ * the only property that matters is that it differs from the last one.
+ */
+function mintGeneration(): string {
+  return randomBytes(8).toString('hex');
+}
+
+function validGeneration(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +186,15 @@ export interface ChunkWriterOptions {
 /** Writer bookkeeping for crash recovery. Never published. */
 interface PersistedManifest extends ChunkManifest {
   droppedEvents: number;
+  /**
+   * The series token, persisted so an ordinary restart continues the same one.
+   *
+   * Optional because a manifest written before generations existed carries no
+   * such field. That is the only case in which this writer cannot recover the
+   * token, and it mints a replacement rather than publishing nothing — see
+   * `open()`.
+   */
+  generation?: string;
 }
 
 export class ChunkWriter {
@@ -189,6 +223,8 @@ export class ChunkWriter {
   #droppedEvents = 0;
   #ready = false;
   #sessionId = '';
+  /** Minted or recovered in `open()`; empty only before it is called. */
+  #generation = '';
 
   constructor(options: ChunkWriterOptions) {
     this.#dir = options.dir;
@@ -200,6 +236,11 @@ export class ChunkWriter {
 
   get chunkNumber(): number {
     return this.#chunk;
+  }
+
+  /** This series' token. Stable until the chunk series is rebuilt. */
+  get generation(): string {
+    return this.#generation;
   }
 
   get lastSeq(): number {
@@ -234,6 +275,7 @@ export class ChunkWriter {
         : (newestSealed?.lastSeq ?? 0),
       retainedBytes: this.#sealedBytes + this.#bytes,
       droppedEvents: this.#droppedEvents,
+      generation: this.#generation,
     };
   }
 
@@ -245,13 +287,34 @@ export class ChunkWriter {
    * back to recover the sequence position and continue appending — this is the
    * one file that may legitimately be extended in place, because nothing has
    * advertised it yet.
+   *
+   * This is also where the series token is decided, and the rule is the one
+   * thing to get right: **the token changes when the chunk series is rebuilt and
+   * at no other time.** Changing it discards every reader's cache of this
+   * session, so a spurious change is a cost paid by every phone; failing to
+   * change it on a rebuild is the stale-cache bug the token exists to prevent.
+   * The chunk files themselves therefore decide, not the manifest: the manifest
+   * lives outside the published tree and can outlive the output it describes.
    */
   async open(sessionId: string): Promise<void> {
     this.#sessionId = sessionId;
     await mkdir(this.#dir, { recursive: true });
     await mkdir(dirname(this.#manifestPath), { recursive: true }).catch(() => {});
 
-    if (existsSync(this.#manifestPath)) {
+    const onDisk = await this.#highestChunkOnDisk();
+
+    if (onDisk === 0) {
+      // A fresh session directory — rebuilt, cold-started, or never written to.
+      // Whatever the manifest still claims describes chunks that no longer
+      // exist, so its token must not be kept: restarting at chunk 1 under the
+      // old one is exactly the stale-cache hazard, since the reader is entitled
+      // to believe `events-0001.jsonl` never changes.
+      this.#sealed = [];
+      this.#sealedBytes = 0;
+      this.#droppedEvents = 0;
+      this.#chunk = 1;
+      this.#generation = mintGeneration();
+    } else if (existsSync(this.#manifestPath)) {
       let parsed: PersistedManifest | null = null;
       try {
         parsed = JSON.parse(await readFile(this.#manifestPath, 'utf8')) as PersistedManifest;
@@ -264,6 +327,12 @@ export class ChunkWriter {
         this.#droppedEvents = parsed.droppedEvents ?? 0;
         this.#sealedBytes = this.#sealed.reduce((sum, c) => sum + c.bytes, 0);
         this.#chunk = this.#sealed.reduce((max, c) => Math.max(max, c.n), 0) + 1;
+        // The series continues, so the token must not move. A manifest written
+        // before generations existed cannot name one, so a fresh token is minted
+        // here: one invalidation on upgrade, after which the session is
+        // protected. Leaving it blank instead would keep every reader on the
+        // unguarded path for as long as the series lives.
+        this.#generation = validGeneration(parsed.generation) ?? mintGeneration();
       } else {
         // A corrupt manifest is recoverable: start numbering above whatever chunk
         // files exist, so nothing already written is overwritten.
@@ -273,10 +342,24 @@ export class ChunkWriter {
         // cached is rewritten in place under the same number — which the reader
         // has no way to notice, because immutability is the property it is
         // entitled to assume.
+        //
+        // The old token is unrecoverable here, so a new one is minted. That
+        // discards cached copies of chunks which did not change — waste, but
+        // never wrong, and the alternative is a reader trusting a token whose
+        // meaning this writer can no longer vouch for.
         this.#sealed = [];
         this.#sealedBytes = 0;
-        this.#chunk = (await this.#highestChunkOnDisk()) + 1;
+        this.#chunk = onDisk + 1;
+        this.#generation = mintGeneration();
       }
+    } else {
+      // Chunks on disk with no manifest at all: the one state that means a
+      // crash before the first seal, because a seal is what persists the
+      // manifest. The open chunk below is recovered and continued, and nothing
+      // has advertised it, so there is no token to recover either — and none to
+      // strand a reader with. Minting one here cannot discard anything a reader
+      // could be holding.
+      this.#generation = mintGeneration();
     }
 
     const path = join(this.#dir, chunkFilename(this.#chunk));
@@ -431,6 +514,10 @@ export class ChunkWriter {
       sessionId: this.#sessionId,
       chunks: this.#sealed,
       droppedEvents: this.#droppedEvents,
+      // Persisted for the same reason the chunks are: so a restart continues
+      // the series rather than silently starting a new one, which would throw
+      // away the reader's cache on every bridge restart.
+      generation: this.#generation,
     };
     await atomicWriteJson(this.#manifestPath, manifest);
   }
