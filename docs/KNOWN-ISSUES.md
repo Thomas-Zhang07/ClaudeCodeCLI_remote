@@ -5,7 +5,7 @@ honest on purpose: several of the bugs below were invisible to the test suite an
 only appeared when the code ran against real data, so the "why it was missed"
 column is as useful as the fix itself.
 
-Last updated: 2026-10-14 (after the out-of-order sequence fix, M7).
+Last updated: 2026-10-14 (after the phone UI rework and the session-ending fix).
 
 ---
 
@@ -201,13 +201,27 @@ the commit that carries them is rewritten.
 The branches also get separate clones, so a force-push on one cannot disturb the
 working tree holding un-consumed prompts on the other.
 
-### 6. `relayDirty` only tracks chunk appends
+### 6. ~~`relayDirty` only tracks chunk appends~~ — RESOLVED
 
-Only appended events set the flag. A change to `state.json` or `index.json`
-alone — a session going idle, a cost update — will not trigger a publish until
-the next event arrives.
+Only appended events set the flag. A change to `index.json` or a session's
+`head.json` alone — a session ending, going idle, becoming controllable — did
+not trigger a publish until the next event arrived.
 
-**Status:** minor; revisit if the phone shows stale status.
+**This was not minor, and the note that said so was wrong.** A session that
+*ends* produces no next event, ever, so the transition that most needs
+publishing was the one that could never be published. The phone showed the
+session as `active` for as long as Gitee kept answering — indefinitely, and
+with no way for the reader to tell it from a genuinely running session.
+
+**Resolved** in `Bridge.#refreshRegistry`: the registry read already computes
+whether a session's published state changed, and that answer now also marks the
+relay dirty and schedules a publish. These transitions are rare — starting,
+ending, going idle, blocking, becoming controllable — as against turn
+boundaries, so this is nowhere near the push budget the debounce protects.
+
+Pinned by `packages/bridge/test/session-ending.test.ts`, which drives a real
+`Bridge` over a local bare repository and asserts the *relay* flips to `ended`
+with no further event.
 
 ### 7. Prompt injection is not implemented
 
@@ -264,6 +278,30 @@ range. A range is O(1) however much history exists, which is exactly what a
 listing could not be. Retention (rolling ~10 MB per session, oldest chunk
 deleted) bounds the relay itself. See `docs/RELAY-DESIGN.md`.
 
+### 27. ~~The refresh button could not deliver a new build~~ — RESOLVED
+
+Reported as "the refresh doesn't really work". It did what it was written to do
+— drop the open session's cached chunks and re-read the relay — and that was the
+wrong thing, because the part that was stale was the *page*.
+
+`registerSW.js` registers a service worker that precaches `index.html` and every
+hashed asset and answers every navigation from that precache, so a reload is
+served the old bundle by design. The browser notices the new `sw.js` on that
+same navigation and installs it — `skipWaiting` and `clientsClaim` mean it takes
+over at once — but the page already loading came from the old cache. **The new
+build arrived on the load after next**, which is why refreshing looked like it
+did nothing and refreshing twice looked like it worked.
+
+**Resolved** by `packages/phone/src/lib/reload.ts`: ask the worker to update,
+wait for it to take control *only when there is actually a new one*, then reload.
+The relay's own cache is dropped at the same time, so one tap means "new app, new
+data". Settings and the sent-prompt history are deliberately untouched.
+
+**The lesson worth keeping:** a stale-data bug and a stale-*app* bug look
+identical from a phone, and this codebase had spent its effort on the first one —
+`refreshNow` had already been rewritten once, at length, to stop re-reading bytes
+it already had. Nobody had asked what serves the page those bytes run in.
+
 ### 19. ~~An orphaned bridge can survive its parent~~ — RESOLVED
 
 **Resolved** by replacing the pid lock with a **heartbeat**. The holder refreshes
@@ -295,6 +333,60 @@ detects a live writer regardless of which pid started it.
 before starting another.
 
 </details>
+
+### 25. ~~A bridge stopped by `ccr` has to be *asked*, not signalled~~ — RESOLVED, with one residual risk
+
+`ccr` stops the bridge it started when its session ends. That was `child.kill()`,
+which on Windows is a `TerminateProcess`: the bridge died between two writes,
+leaving an `index.json` on disk — and on the relay — still describing a session
+that had just closed. On its own this would have been a two-second staleness
+that the next tick corrected; combined with issue 6 there was no next publish to
+correct it with, so the phone kept the stale status forever.
+
+**Resolved** by a request file (`packages/bridge/src/stop-request.ts`). `ccr`
+writes the pid of the bridge it started, waits for it to exit, and force-kills
+only if it does not; the bridge honours a request naming **its own pid** by
+reading the registry one last time, sealing its chunks, writing a final head and
+index, and publishing before it releases the lock and exits.
+
+**Why a request and not self-detection.** A bridge could have decided this for
+itself — "no `ccr` sessions left, so I am done" — and that is one fewer moving
+part. It is also racy: a second `ccr` starting in the window between `ensureBridge`
+and `registerControlled` looks exactly like an idle machine, and the first
+session's bridge would exit underneath it. The `others.length > 0` check happens
+*before* the request is written, so a session that has started but not yet
+registered still counts.
+
+**Why the pid and an age limit.** A request left behind by a `ccr` that crashed
+names a bridge that is already gone. Without the check it would stop whichever
+bridge came next — the same class of bug, moved rather than removed. Pids are
+also reused, so a request only means something while it is recent.
+
+**Residual risk:** if the publish cannot finish inside the grace period (15 s),
+`ccr` kills the bridge anyway and the relay keeps the stale status. The local
+files are still correct, so a later bridge republishes them on its next event.
+Nothing detects and repairs that case on its own.
+
+### 26. The session drawer does not hold focus or the back gesture
+
+`SessionPanel.vue` is a modal dialog by declaration — `role="dialog"`,
+`aria-modal="true"` — and by behaviour for touch: the backdrop closes it, the
+scrim does not let a drag through to the conversation behind it, and `Esc`
+closes it from anywhere in the app.
+
+Two things it does not do:
+
+- **Focus is not trapped.** Tab from the close button walks out into the
+  conversation behind the panel, which is still in the tab order and is not
+  visible.
+- **The Android back gesture leaves the session rather than closing the
+  drawer.** The session lives in the URL hash so that back lands where the user
+  was, and that handler does not know the drawer exists — so back from an open
+  drawer goes to the session list.
+
+**Status:** open, and the second one is the one a phone user will actually hit.
+Fixing it means pushing a history entry when the drawer opens and closing on
+`popstate`, which is the same mechanism the session itself already uses.
 
 ### 17. The reader's cache is smaller than the retention window
 
