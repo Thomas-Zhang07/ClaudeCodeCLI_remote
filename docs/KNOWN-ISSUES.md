@@ -91,14 +91,39 @@ the next event arrives.
 Sessions are all read-only: `applyRegistry(entry, false)` hard-codes
 `controllable: false`. This is M6, and it depends on M5 (`ccr`).
 
-### 8. The permission-dialog gate is inference-only
+### 8. ~~The permission-dialog gate is inference-only~~ — RESOLVED by hooks, with one accepted gap
+
+**Resolved** by the hooks integration (M7). The bridge runs a loopback receiver;
+a forwarder script, installed into Claude Code settings, posts each hook event to
+it. The safety-critical signal is **`PreToolUse` with no matching completion**,
+because `PreToolUse` runs *before* the permission check — so a dialog-blocked call
+is "in flight" from the moment the dialog opens.
+
+`Notification`/`permission_prompt` is used as well, but **cannot be the primary
+signal**: it fires several seconds after the dialog appears. Relying on it alone
+would leave a window in which a prompt could be typed into a dialog.
+
+The transcript rule still applies for sessions without hooks, so nothing is
+weakened where hooks are absent.
+
+**Accepted residual risk:** if hooks stop silently *while a session is idle*,
+they remain trusted for that session and a dialog appearing afterwards would be
+missed. Detecting it by timeout was rejected deliberately — an idle session with
+no hook events for an hour is the normal, healthy case, and a timeout would
+refuse exactly the sessions this milestone exists to unblock. Hook state is also
+in memory only, so a bridge restart falls back to the transcript until the
+session's next turn.
+
+<details><summary>Original report</summary>
 
 Injecting while a permission dialog is open would **answer the dialog** rather
 than type the prompt — potentially auto-approving a tool. Detecting that from
 the tail alone is guesswork; the reliable detector is a `PreToolUse`/
 `PostToolUse` hook pair (M7).
 
-**Status:** not implemented. Injection must not ship before this.
+**Status:** superseded by the hooks receiver above.
+
+</details>
 
 ---
 

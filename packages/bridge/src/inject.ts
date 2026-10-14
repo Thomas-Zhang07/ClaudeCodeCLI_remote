@@ -30,7 +30,9 @@ export type InjectionRefusal =
   | 'injection-disabled'
   | 'unknown-session'
   | 'not-controllable'
-  | 'session-not-idle';
+  | 'session-not-idle'
+  | 'permission-dialog-open'
+  | 'tool-in-flight';
 
 /**
  * Find which of the prompts we typed matches a turn that has appeared.
@@ -80,6 +82,25 @@ export interface InjectionContext {
    * continued from the phone, never begun.
    */
   isFresh: boolean;
+  /**
+   * Hook events are reaching the bridge for this session, and are current.
+   *
+   * When true, hooks answer the idle question authoritatively and the transcript
+   * is not consulted. When false — hooks not installed, not configured for this
+   * session, gone quiet, or the receiver down — the `lastMainKind`/`isFresh`
+   * rule below applies exactly as it did before hooks existed, so nothing is
+   * made less safe by their absence.
+   */
+  hooksLive: boolean;
+  /**
+   * A permission dialog is on screen on the PC right now.
+   *
+   * Only consulted while `hooksLive`; without hooks we do not know, and the
+   * transcript rule is the conservative answer.
+   */
+  dialogOpen: boolean;
+  /** A tool call has started and has not finished. Only consulted while `hooksLive`. */
+  toolInFlight: boolean;
 }
 
 /**
@@ -88,22 +109,47 @@ export interface InjectionContext {
  * Pure and separate from delivery so the rule can be tested directly, because
  * it is the rule that keeps typing from being dangerous.
  *
- * The `turn_end` requirement is the important one. **A permission dialog only
- * exists mid-turn**, so requiring the main thread to have *finished* a turn
- * proves no dialog is open — and typing into a dialog answers it, which can
- * approve a tool rather than submit a prompt.
+ * Two sources answer the same question, in this order:
  *
- * It is checked against the transcript rather than the session's status because
- * "waiting for input" is what an idle prompt reports too, so the status cannot
- * tell the two apart. Injecting mid-turn is merely unhelpful, since Claude Code
- * queues it; answering a dialog is not.
+ *  1. **Hooks**, when they are live for this session. A `PreToolUse` with no
+ *     matching completion means a tool is in flight, and a permission dialog —
+ *     if one is open — is blocking exactly that call; a `Notification` naming a
+ *     permission dialog says so outright; a `Stop` says the turn ended. This is
+ *     the authoritative answer, and it is the one that fixes the false refusals
+ *     below.
+ *  2. **The transcript**, otherwise. The `turn_end` requirement is the
+ *     important one here. **A permission dialog only exists mid-turn**, so
+ *     requiring the main thread to have *finished* a turn proves no dialog is
+ *     open — and typing into a dialog answers it, which can approve a tool
+ *     rather than submit a prompt. It is read from the transcript rather than
+ *     the session's status because "waiting for input" is what an idle prompt
+ *     reports too, so the status cannot tell the two apart.
  *
- * Fails closed: anything unrecognised refuses.
+ * `turn_end` is a weaker signal than it looks: `turn_duration` is not written
+ * after every turn, so a session that finished one without it looks busy
+ * indefinitely. Hooks exist to replace that inference, not to weaken it — hence
+ * the order above, and hence the transcript rule surviving untouched beneath.
+ *
+ * Fails closed: anything unrecognised refuses, and hook state is only believed
+ * while `hooksLive` says the events are actually arriving.
  */
 export function injectionRefusal(context: InjectionContext): InjectionRefusal | null {
   if (!context.injectionEnabled) return 'injection-disabled';
   if (!context.hasSession) return 'unknown-session';
   if (!context.controllable) return 'not-controllable';
+
+  if (context.hooksLive) {
+    // Both refusals are the same class of hazard — typing lands on something
+    // other than the prompt box. An open dialog is the dangerous one; a tool in
+    // flight is merely useless and confusing, and worth refusing for the same
+    // reason the mid-turn case is: the prompt queues and may never be run.
+    if (context.dialogOpen) return 'permission-dialog-open';
+    if (context.toolInFlight) return 'tool-in-flight';
+    // Hooks saw nothing blocking. That is a stronger statement than the
+    // transcript's, because it is derived from `Stop` rather than from a
+    // `turn_duration` record that may never have been written.
+    return null;
+  }
 
   // A completed turn proves the session is idle at a clean prompt — and, since
   // a dialog only exists mid-turn, that none is open.

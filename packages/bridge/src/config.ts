@@ -10,6 +10,16 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * Port the hook receiver listens on until told otherwise.
+ *
+ * Kept below 32768 so it sits under the ephemeral range on both Windows (49152)
+ * and Linux (32768), where a transient outbound connection could otherwise be
+ * holding it. `scripts/install-hooks.mjs` writes the same value into `.env`, and
+ * a test asserts the two have not drifted apart.
+ */
+export const DEFAULT_HOOK_PORT = 27182;
+
 export interface BridgeConfig {
   /** Root of the Claude Code transcript store. */
   projectsDir: string;
@@ -59,6 +69,28 @@ export interface BridgeConfig {
    * cannot: an orphaned bridge survives its parent and keeps writing.
    */
   lockStaleMs: number;
+
+  /**
+   * Port the hook receiver listens on, loopback only.
+   *
+   * Below both the Windows and the Linux ephemeral ranges (49152 / 32768), so a
+   * transient outbound connection cannot already be holding it.
+   */
+  hookPort: number;
+  /**
+   * Shared secret every hook request must carry.
+   *
+   * Written by `scripts/install-hooks.mjs`. Null means the receiver accepts
+   * unauthenticated requests from anything on this machine, and says so once at
+   * startup — the endpoint only records state, but a forged `Stop` would clear
+   * the dialog flag, so a local process could unlock injection.
+   */
+  hookToken: string | null;
+  /**
+   * How far the transcript may run ahead of the hook stream before hooks are
+   * treated as having gone quiet. See `hooksCurrent`.
+   */
+  hookQuietMs: number;
 
   allowInjection: boolean;
   /** Prompts older than this are refused, bounding the value of a captured file. */
@@ -185,6 +217,10 @@ export function loadConfig(
     maxSessions: num(env['CCR_MAX_SESSIONS'], 50),
     maxChunksPerSession: num(env['CCR_MAX_CHUNKS'], 300),
     lockStaleMs: num(env['CCR_LOCK_STALE_MS'], 20_000),
+
+    hookPort: num(env['CCR_HOOK_PORT'], DEFAULT_HOOK_PORT),
+    hookToken: env['CCR_HOOK_TOKEN'] ?? null,
+    hookQuietMs: num(env['CCR_HOOK_QUIET_MS'], 120_000),
 
     allowInjection: bool(env['CCR_ALLOW_INJECTION']),
     promptMaxAgeMs: num(env['CCR_PROMPT_MAX_AGE_MS'], 10 * 60 * 1000),

@@ -80,6 +80,10 @@ describe('injectionRefusal', () => {
     controllable: true,
     lastMainKind: 'turn_end',
     isFresh: false,
+    // No hooks installed: the transcript rule, exactly as it was before hooks.
+    hooksLive: false,
+    dialogOpen: false,
+    toolInFlight: false,
   };
 
   it('allows a prompt when the session is idle after a completed turn', () => {
@@ -152,8 +156,73 @@ describe('injectionRefusal', () => {
         hasSession: false,
         controllable: false,
         lastMainKind: null,
+        isFresh: false,
+        hooksLive: true,
+        dialogOpen: true,
+        toolInFlight: true,
       }),
     ).toBe('injection-disabled');
+  });
+
+  describe('when hooks are live', () => {
+    // This is the case hooks exist for. `turn_duration` is not written after
+    // every turn, so the transcript can say "mid-turn" for a session that has
+    // been sitting at the prompt for an hour. Hooks say otherwise, and they are
+    // believed.
+    it('allows a prompt the transcript would have refused, because the turn ended', () => {
+      expect(
+        injectionRefusal({ ...ready, hooksLive: true, lastMainKind: 'assistant_text' }),
+      ).toBeNull();
+    });
+
+    it('allows a prompt to a session that has recorded nothing yet', () => {
+      expect(injectionRefusal({ ...ready, hooksLive: true, lastMainKind: null, isFresh: false })).toBeNull();
+    });
+
+    it('refuses while a permission dialog is open', () => {
+      expect(injectionRefusal({ ...ready, hooksLive: true, dialogOpen: true })).toBe(
+        'permission-dialog-open',
+      );
+    });
+
+    it('refuses while a tool call is in flight', () => {
+      expect(injectionRefusal({ ...ready, hooksLive: true, toolInFlight: true })).toBe('tool-in-flight');
+    });
+
+    it('reports the dialog, not the tool, when both are true', () => {
+      // A dialog blocks a tool call, so the two arrive together. The dialog is
+      // the one that must be named: it is the dangerous one, and the one the
+      // person on the PC can act on.
+      expect(
+        injectionRefusal({ ...ready, hooksLive: true, dialogOpen: true, toolInFlight: true }),
+      ).toBe('permission-dialog-open');
+    });
+
+    it('still refuses a session it cannot type into at all', () => {
+      expect(injectionRefusal({ ...ready, hooksLive: true, controllable: false })).toBe(
+        'not-controllable',
+      );
+    });
+  });
+
+  describe('when hooks are not live', () => {
+    // Not installed, never reported for this session, or gone quiet. Nothing is
+    // less safe than before hooks existed — the transcript rule is unchanged.
+    it('ignores hook state rather than trusting a stale dialog flag', () => {
+      expect(
+        injectionRefusal({ ...ready, hooksLive: false, dialogOpen: true, toolInFlight: true }),
+      ).toBeNull();
+    });
+
+    it('falls back to the transcript for a session mid-turn', () => {
+      expect(
+        injectionRefusal({ ...ready, hooksLive: false, lastMainKind: 'tool_call', isFresh: false }),
+      ).toBe('session-not-idle');
+    });
+
+    it('still allows a brand-new session', () => {
+      expect(injectionRefusal({ ...ready, hooksLive: false, lastMainKind: null, isFresh: true })).toBeNull();
+    });
   });
 });
 

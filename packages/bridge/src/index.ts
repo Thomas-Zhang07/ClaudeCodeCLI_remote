@@ -18,6 +18,7 @@ import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promise
 import { join } from 'node:path';
 
 import {
+  type AttentionLevel,
   type InjectionState,
   type NormalizedEvent,
   type RelayIndex,
@@ -30,8 +31,18 @@ import { ChunkWriter, atomicWriteJson } from './chunker.js';
 import { bootstrapConfig, type BridgeConfig } from './config.js';
 import { readControlled } from './control.js';
 import { sendControlMessage, type ControlledSession } from './control.js';
+import {
+  applyHookEvent,
+  hookFacts,
+  hooksCurrent,
+  startHookServer,
+  HOOK_PATH,
+  type HookPayload,
+  type HookServer,
+  type HookSessionState,
+} from './hooks.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
-import { injectionRefusal, matchDeliveredTurn } from './inject.js';
+import { injectionRefusal, matchDeliveredTurn, type InjectionRefusal } from './inject.js';
 import { RelaySync } from './sync.js';
 import {
   readJson,
@@ -52,6 +63,30 @@ import { Tailer, type TailState } from './tailer.js';
  * shape of the data — is what bounds how large the relay grows.
  */
 const PUBLISH_TRIGGERS: ReadonlySet<string> = new Set(['turn_end', 'attention', 'injection']);
+
+/**
+ * How a refusal is worded for the phone.
+ *
+ * Refusals are read on a phone with no other context, and these three are the
+ * ones a person will actually hit, so each says what to do about it. The bare
+ * reason alone gives them nothing to act on.
+ */
+const REFUSAL_DETAIL: Partial<Record<InjectionRefusal, string>> = {
+  'session-not-idle': 'session-not-idle: it is mid-turn. Send again once the turn finishes.',
+  'permission-dialog-open':
+    'permission-dialog-open: a permission prompt is waiting on the PC. Answer it there — typing here would answer it for you.',
+  'tool-in-flight': 'tool-in-flight: a tool is still running on the PC. Send again when it finishes.',
+};
+
+/**
+ * Hook sessions tracked at once.
+ *
+ * Hooks fire for every session on the machine, including ones the relay will
+ * never publish, so this cannot grow without bound. Past the cap the least
+ * recently heard-from session is dropped; losing its state only means falling
+ * back to the transcript rule until its next event.
+ */
+const MAX_HOOK_SESSIONS = 200;
 
 interface PersistedState {
   version: 1;
@@ -104,6 +139,17 @@ interface SessionRuntime {
    * otherwise make the main thread look busy, or idle, at random.
    */
   lastMainKind: string | null;
+  /**
+   * Timestamp of the newest main-thread event read from this session's
+   * transcript, or 0.
+   *
+   * Compared against the last hook event to notice that hooks have stopped
+   * delivering: if the transcript keeps moving and the hook stream does not,
+   * something is being missed, and the guard must stop trusting it. Taken from
+   * the event's own timestamp rather than from when it was read, so a cold-start
+   * replay of old lines cannot look like fresh activity.
+   */
+  lastMainEventAt: number;
 }
 
 export class Bridge {
@@ -132,6 +178,16 @@ export class Bridge {
   #awaitingDelivery = new Map<string, { promptId: string; text: string; at: number }[]>();
   /** A trigger arrived while a publish was already running. */
   #republish = false;
+  /**
+   * What hooks have reported, per session.
+   *
+   * Keyed by session id and kept whether or not the relay knows the session:
+   * events arrive for sessions the bridge has not discovered yet, and the state
+   * has to be there when it does.
+   */
+  #hookState = new Map<string, HookSessionState>();
+  /** The hook receiver, or null when it could not start. */
+  #hooks: HookServer | null = null;
 
   constructor(config: BridgeConfig) {
     this.#config = config;
@@ -153,6 +209,7 @@ export class Bridge {
     await this.#tick();
 
     await this.#startRelay();
+    await this.#startHooks();
 
     this.#timers.push(
       setInterval(() => {
@@ -185,6 +242,97 @@ export class Bridge {
         }, this.#config.pollIntervalMs),
       );
     }
+  }
+
+  /**
+   * Start the hook receiver, if the port is free.
+   *
+   * A port already in use is not a failure worth stopping for: everything still
+   * works, the guard simply falls back to the transcript rule for every session,
+   * which is exactly what it did before hooks existed. Refusing to start would
+   * be a worse answer to a missing convenience.
+   */
+  async #startHooks(): Promise<void> {
+    const log = (message: string): void => {
+      process.stderr.write(`[hooks] ${message}\n`);
+    };
+
+    if (this.#config.hookToken === null) {
+      // Not fatal, but worth one line: an unauthenticated loopback endpoint
+      // lets any local process forge a `Stop` and clear the dialog flag.
+      log('no CCR_HOOK_TOKEN configured; accepting any request from this machine');
+    }
+
+    try {
+      this.#hooks = await startHookServer({
+        port: this.#config.hookPort,
+        token: this.#config.hookToken,
+        onEvent: (payload) => this.#onHookEvent(payload),
+        log,
+      });
+      log(`listening on http://127.0.0.1:${this.#config.hookPort}${HOOK_PATH}`);
+    } catch (error) {
+      this.#hooks = null;
+      log(
+        `unavailable on port ${this.#config.hookPort} (${String(error)}); ` +
+          'continuing without them, so the transcript rule decides',
+      );
+    }
+  }
+
+  /**
+   * Fold one hook event in, and surface what the phone should know.
+   *
+   * Synchronous on purpose: a hook is waiting on this response, and holding it
+   * open would slow the PC down for nothing.
+   */
+  #onHookEvent(payload: HookPayload): void {
+    const previous = this.#hookState.get(payload.sessionId);
+    const { state, attention } = applyHookEvent(previous, payload, Date.now());
+    this.#hookState.set(payload.sessionId, state);
+    this.#trimHookState();
+
+    if (!previous?.hooksLive) {
+      process.stderr.write(
+        `[hooks] ${payload.sessionId}: ${payload.eventName} (first event for this session)\n`,
+      );
+    }
+
+    if (!attention) return;
+    process.stderr.write(`[hooks] ${payload.sessionId}: ${attention.text}\n`);
+
+    // The state stands whether or not the relay knows this session; only the
+    // timeline entry needs somewhere to go.
+    const runtime = this.#sessions.get(payload.sessionId);
+    if (!runtime) return;
+    void this.#recordAttention(runtime, attention.text, attention.level).catch(() => {});
+  }
+
+  #trimHookState(): void {
+    if (this.#hookState.size <= MAX_HOOK_SESSIONS) return;
+
+    const oldest = [...this.#hookState.entries()]
+      .sort((a, b) => a[1].lastEventAt - b[1].lastEventAt)
+      .slice(0, this.#hookState.size - MAX_HOOK_SESSIONS);
+    for (const [sessionId] of oldest) this.#hookState.delete(sessionId);
+  }
+
+  /**
+   * Whether hook state for a session may be believed over the transcript.
+   *
+   * Three ways it may not be, all of which fall back to the transcript rule
+   * unchanged: no receiver is listening, no hook has ever reported for this
+   * session, or the transcript has moved on while the hook stream has not — in
+   * which case events are being missed and the state is stale in an unknown
+   * direction.
+   */
+  #hooksTrusted(sessionId: string, runtime: SessionRuntime | undefined): boolean {
+    if (!this.#hooks?.running) return false;
+    return hooksCurrent(
+      this.#hookState.get(sessionId),
+      runtime?.lastMainEventAt ?? 0,
+      this.#config.hookQuietMs,
+    );
   }
 
   /**
@@ -350,6 +498,8 @@ export class Bridge {
     };
 
     const registration = entry ? this.#controlledPids.get(entry.pid) : undefined;
+    const facts = hookFacts(this.#hookState.get(prompt.sessionId));
+
     const refusal = injectionRefusal({
       injectionEnabled: this.#config.allowInjection,
       hasSession: Boolean(runtime && entry),
@@ -360,15 +510,17 @@ export class Bridge {
       // existed before the bridge began is not fresh: it was cold-started and
       // replayed, or restored from persisted state, so its sequence is past 0.
       isFresh: runtime?.aggregator.seq === 0,
+      // Passed as they stand even when they are not trusted, so the guard's
+      // decision is legible from its inputs; `hooksLive` is what gates using
+      // them, and it is false when the stream is missing or has gone quiet.
+      hooksLive: this.#hooksTrusted(prompt.sessionId, runtime),
+      dialogOpen: facts.dialogOpen,
+      toolInFlight: facts.toolInFlight,
     });
     if (refusal) {
-      // Spell out the mid-turn case. It is the one a person will actually hit,
-      // and "session-not-idle" alone gives them nothing to act on.
-      const detail =
-        refusal === 'session-not-idle'
-          ? 'session-not-idle: it is mid-turn. Send again once the turn finishes.'
-          : refusal;
-      return refuse('rejected', detail);
+      // Spell out the reasons a person will actually hit, and what to do about
+      // each. The bare reason alone tells them nothing.
+      return refuse('rejected', REFUSAL_DETAIL[refusal] ?? refusal);
     }
 
     // The guard has already refused when either is missing; repeating it here is
@@ -454,6 +606,35 @@ export class Bridge {
   }
 
   /**
+   * Surface a moment worth waking the phone for.
+   *
+   * A permission dialog is the clearest one there is: the PC is stopped, nothing
+   * will move until someone answers, and the transcript has no entry for it — so
+   * before hooks, the phone could only guess at it from `status`/`waitingFor`,
+   * which the session registry does not reliably carry.
+   */
+  async #recordAttention(
+    runtime: SessionRuntime,
+    text: string,
+    level: AttentionLevel,
+  ): Promise<void> {
+    const event = runtime.aggregator.record({
+      ts: new Date().toISOString(),
+      sessionId: runtime.sessionId,
+      agentId: null,
+      kind: 'attention',
+      text,
+      level,
+    });
+    await runtime.chunker.append(event);
+    runtime.stateDirty = true;
+    this.#relayDirty = true;
+    // One of the few events worth a publish on its own — the phone is meant to
+    // show this while the session sits there blocked.
+    this.#schedulePublish();
+  }
+
+  /**
    * Refuse to run alongside another bridge.
    *
    * Two bridges share one state directory and one clone, so they race on the
@@ -523,6 +704,12 @@ export class Bridge {
     this.#running = false;
     for (const timer of this.#timers) clearInterval(timer);
     this.#timers = [];
+
+    // Closed before anything else, so a hook arriving mid-shutdown cannot be
+    // answered with state that is about to disappear.
+    const hooks = this.#hooks;
+    this.#hooks = null;
+    await hooks?.close().catch(() => {});
 
     // Seal every open chunk so nothing is left unadvertised.
     for (const runtime of this.#sessions.values()) {
@@ -655,6 +842,9 @@ export class Bridge {
       // waited for, since waiting means refusing every prompt until the session
       // happens to emit something on its own.
       lastMainKind: saved?.lastMainKind ?? (await chunker.readLastMainKind()),
+      // Not persisted, and deliberately: hook state is in memory only, and a
+      // restart means no hooks have been heard from yet in this process.
+      lastMainEventAt: 0,
     });
   }
 
@@ -762,7 +952,13 @@ export class Bridge {
   ): Promise<void> {
     for (const event of events) {
       await runtime.chunker.append(event);
-      if (!fromAgent) runtime.lastMainKind = event.kind;
+      if (!fromAgent) {
+        runtime.lastMainKind = event.kind;
+        // The session's own clock, not the time we read the line: a cold-start
+        // replay of yesterday's events must not look like activity now.
+        const at = Date.parse(event.ts);
+        if (Number.isFinite(at) && at > runtime.lastMainEventAt) runtime.lastMainEventAt = at;
+      }
 
       // A prompt we typed has shown up as a turn, so it genuinely arrived.
       if (!fromAgent && event.kind === 'user_prompt') {
@@ -853,6 +1049,9 @@ export class Bridge {
   /** Delete a session's relayed data and stop tracking it. */
   async #forgetSession(sessionId: string): Promise<void> {
     this.#sessions.delete(sessionId);
+    // Its hook state goes too: keeping it would leak one entry per session ever
+    // seen, and a forgotten session has no prompt left to guard.
+    this.#hookState.delete(sessionId);
     await rm(join(this.#config.outDir, 'sessions', sessionId), {
       recursive: true,
       force: true,
