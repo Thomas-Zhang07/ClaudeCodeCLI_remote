@@ -14,7 +14,8 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:phone",
+    "typecheck:phone": "npm run typecheck --prefix packages/phone && npm run typecheck:node --prefix packages/phone",
     "bridge": "npm run start --workspace @ccr/bridge",
     "ccr": "npm run ccr --workspace @ccr/bridge",
     "phone:dev": "npm run dev --prefix packages/phone",

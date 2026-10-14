@@ -7,8 +7,10 @@ The transport is a git repository used as a mailbox. The PC writes events to it;
 them over the Gitee API and writes prompts back the same way. There is no relay, no database, and
 nothing to keep running in the cloud.
 
-> **Status: work in progress.** The design is settled and verified against real session data; the
-> implementation is being built milestone by milestone. See [Roadmap](#roadmap).
+> **Status: working.** Every milestone has shipped and the phone has driven real
+> sessions end to end. What remains is tracked, with the reasoning, in
+> [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) — read that before turning on
+> prompt injection.
 
 ---
 
@@ -41,7 +43,7 @@ PC                                                                     Gitee (pr
                                                                   (CORS ✓)     │   ▼
 └────────────────────────────────────────────────────────┘        ┌─────────────────────────┐
                                                                   │  Phone PWA              │
-   plain `claude` sessions: registry-known, read-only             │  Vite + TypeScript      │
+   plain `claude` sessions: registry-known, read-only             │  Vue 3 + TypeScript     │
                                                                   └─────────────────────────┘
 ```
 
@@ -137,7 +139,10 @@ Copy `.env.example` to `.env` and fill it in. The bridge reads:
 | `CCR_OUT_BRANCH` | Branch the bridge publishes to (default `relay-out`) |
 | `CCR_IN_BRANCH` | Branch the phone writes prompts to (default `relay-in`) |
 | `CCR_SECRET` | Shared secret for signing injected prompts |
+| `CCR_ALLOW_INJECTION` | Whether the bridge may type into a session at all. Off by default — without it, prompts are accepted and never executed |
 | `CCR_STATE_DIR` | Where tail offsets and chunk state are persisted |
+
+`.env.example` documents the rest; every one of them has a working default.
 
 **Why two branches.** Outbound data is rewritten — each publish amends a single
 commit and force-pushes, so the repository does not accumulate a commit every few
@@ -156,10 +161,15 @@ npm run build
 # monitor only — tails every session, read-only
 npm run bridge
 
-# or launch a controllable session in the current directory.
-# Every argument after `ccr` is passed straight through to Claude Code, so
+# or launch a controllable session. `ccr` is a global command (install it with
+# `npm link` from packages/bridge) and the session starts in whichever directory
+# you run it from. Every argument is passed straight through to Claude Code, so
 # anything you would normally type works here unchanged.
-npm run ccr
+ccr
+
+# Not `npm run ccr`: npm changes into the package directory before running a
+# script, so the session's working directory would be packages/bridge rather
+# than wherever you are.
 
 # phone UI
 npm run phone:dev      # local dev server
@@ -170,8 +180,18 @@ npm run phone:build    # produces packages/phone/dist for deployment
 
 A Vue 3 PWA. It talks to the Gitee API directly from the browser, so it needs an
 **https origin** — Web Crypto, which signs prompts, is only available in a secure
-context. Deploy `packages/phone/dist` anywhere that serves https; Netlify
-publishes it from this repository with no configuration.
+context. `localhost` counts, so the dev server is fine.
+
+Deploy `packages/phone/dist` anywhere that serves https. `dist/` is gitignored,
+so this is a build-and-upload — drag the folder onto Netlify, or point a static
+host at it. A repo-connected build needs its own configuration (base
+`packages/phone`, build `npm install && npm run build`, publish `dist`), because
+the phone is not an npm workspace of the root.
+
+Build it where the repository `.env` lives: `VITE_CCR_OWNER`, `VITE_CCR_REPO`
+and `VITE_CCR_POLL_MS` are baked into the bundle at build time. The token and
+the signing secret deliberately are not — they are entered on the device and
+kept in `localStorage`.
 
 The page holds no data of its own. You enter the repository owner, name, token
 and signing secret once, and they are kept in the browser's `localStorage`.
@@ -197,15 +217,18 @@ Mitigations in place:
 ## Roadmap
 
 - [x] Design + verification against real session data
-- [ ] **M0** Prerequisites, scaffold, configuration
-- [ ] **M1** Transcript parser (`packages/shared`) with fixtures
-- [ ] **M2** Bridge — local tailing, normalization, chunk writing
-- [ ] **M3** Gitee sync — push, poll, rate-limit backoff, inbound reader
+- [x] **M0** Prerequisites, scaffold, configuration
+- [x] **M1** Transcript parser (`packages/shared`) with fixtures
+- [x] **M2** Bridge — local tailing, normalization, chunk writing
+- [x] **M3** Gitee sync — push, poll, rate-limit backoff, inbound reader
 - [x] **M4** Phone PWA — session list, chat, diffs, subagent tree
 - [x] **M5** `ccr` — ConPTY passthrough wrapper
-- [ ] **M6** Prompt injection with the permission-dialog guard
-- [ ] **M7** Optional hooks for lower-latency attention state
-- [ ] **M8** Retention, compaction, quota display
+- [x] **M6** Prompt injection with the permission-dialog guard
+- [x] **M7** Optional hooks for lower-latency attention state
+- [x] **M8** Retention and compaction. The quota display was **dropped**, not
+      deferred: an authenticated Gitee request carries no rate-limit headers and
+      `/api/v5/rate_limit` is a 404, so there is nothing to display. Backoff is
+      reactive, on 429/403 — see [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) #1.
 
 ## License
 

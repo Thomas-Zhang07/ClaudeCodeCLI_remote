@@ -51,26 +51,26 @@ export function parseRegistryEntry(raw: unknown): RegistryEntry | null {
 /**
  * Map the harness's own status vocabulary onto ours.
  *
+ * A waiting reason outranks the status word, because the harness can still
+ * report `active` for a session that is in fact stopped behind a prompt.
+ *
  * Anything unrecognised becomes `idle` rather than `active`: over-reporting
  * activity would make the phone claim work is happening when it is not, which is
  * worse than a stale-looking session.
+ *
+ * This is the only copy. The bridge had a character-for-character duplicate of
+ * it for a while, which is a divergence waiting to happen — the two would have
+ * had to be changed together and nothing said so.
  */
 export function toSessionStatus(entry: RegistryEntry): SessionStatus {
   const status = (entry.rawStatus ?? '').toLowerCase();
   const waiting = (entry.waitingFor ?? '').toLowerCase();
 
-  if (waiting && waiting !== '') return 'waiting';
+  if (waiting) return 'waiting';
   if (status === 'waiting' || status === 'blocked') return 'waiting';
   if (status === 'active' || status === 'working' || status === 'busy') return 'active';
   if (status === 'ended' || status === 'exited' || status === 'stopped') return 'ended';
   return 'idle';
-}
-
-/** The waiting reason, if there is one, phrased for display. */
-export function toWaitingFor(entry: RegistryEntry): string | null {
-  const waiting = entry.waitingFor;
-  if (!waiting) return null;
-  return waiting;
 }
 
 function str(v: unknown): string | null {

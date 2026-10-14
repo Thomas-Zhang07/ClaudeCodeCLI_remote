@@ -18,6 +18,7 @@ import {
   isTranscriptEvent,
   parseTranscriptEntry,
   parseSubagentMeta,
+  toSessionStatus,
   type EventDraft,
   type EventKind,
   type NormalizedEvent,
@@ -254,7 +255,7 @@ export class SessionAggregator {
 
     // No registry entry means no live process, so the session has ended. The
     // registry is authoritative: a transcript outlives the process that wrote it.
-    const status: SessionStatus = entry ? registryStatus(entry) : 'ended';
+    const status: SessionStatus = entry ? toSessionStatus(entry) : 'ended';
     if (this.#state.status !== status) {
       this.#state.status = status;
       dirty = true;
@@ -314,17 +315,6 @@ export class SessionAggregator {
   idleFor(now = Date.now()): number {
     return this.#lastEventAt === 0 ? Number.POSITIVE_INFINITY : now - this.#lastEventAt;
   }
-}
-
-function registryStatus(entry: RegistryEntry): SessionStatus {
-  const status = (entry.rawStatus ?? '').toLowerCase();
-  const waiting = (entry.waitingFor ?? '').toLowerCase();
-
-  if (waiting) return 'waiting';
-  if (status === 'waiting' || status === 'blocked') return 'waiting';
-  if (status === 'active' || status === 'working' || status === 'busy') return 'active';
-  if (status === 'ended' || status === 'exited' || status === 'stopped') return 'ended';
-  return 'idle';
 }
 
 function sameMeta(a: SubagentMeta, b: SubagentMeta): boolean {
