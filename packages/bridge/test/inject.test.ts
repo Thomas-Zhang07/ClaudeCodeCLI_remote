@@ -5,6 +5,7 @@ import {
   PASTE_START,
   injectPrompt,
   injectionRefusal,
+  matchDeliveredTurn,
   splitByBytes,
   type WriteTarget,
 } from '../src/inject.js';
@@ -20,6 +21,57 @@ function recorder(): WriteTarget & { chunks: string[]; all: () => string } {
     all: () => chunks.join(''),
   };
 }
+
+describe('matchDeliveredTurn', () => {
+  const sent = (text: string) => ({ text });
+
+  it('matches a turn that is exactly what we typed', () => {
+    expect(matchDeliveredTurn([sent('run the tests')], 'run the tests')).toBe(0);
+  });
+
+  it('ignores differences in whitespace and line endings', () => {
+    expect(matchDeliveredTurn([sent('run  the\ntests')], 'run the tests')).toBe(0);
+  });
+
+  it('finds the right prompt among several', () => {
+    const waiting = [sent('first prompt'), sent('second prompt'), sent('third prompt')];
+    expect(matchDeliveredTurn(waiting, 'second prompt')).toBe(1);
+  });
+
+  it('returns -1 when nothing matches', () => {
+    expect(matchDeliveredTurn([sent('run the tests')], 'something the user typed')).toBe(-1);
+  });
+
+  it('returns -1 for an empty turn rather than matching the first entry', () => {
+    // An empty turn matching everything would confirm a prompt that never arrived.
+    expect(matchDeliveredTurn([sent('anything')], '   ')).toBe(-1);
+  });
+
+  it('ignores an empty entry rather than confirming it', () => {
+    expect(matchDeliveredTurn([sent('')], 'a real turn')).toBe(-1);
+  });
+
+  it('matches a long prompt whose stored turn was truncated', () => {
+    const body = 'Refactor the chunk reader so that '.repeat(20);
+    const stored = `${body.slice(0, 400)}… [+1200 bytes]`;
+    expect(matchDeliveredTurn([sent(body)], stored)).toBe(0);
+  });
+
+  it('does not match on a short shared prefix', () => {
+    // "fix the bug" and "fix the build" share a prefix but are different prompts.
+    expect(matchDeliveredTurn([sent('fix the bug')], 'fix the build report')).toBe(-1);
+  });
+
+  it('does not match merely because both are long', () => {
+    const a = 'a'.repeat(300);
+    const b = 'b'.repeat(300);
+    expect(matchDeliveredTurn([sent(a)], b)).toBe(-1);
+  });
+
+  it('handles an empty waiting list', () => {
+    expect(matchDeliveredTurn([], 'anything')).toBe(-1);
+  });
+});
 
 describe('injectionRefusal', () => {
   const ready = {

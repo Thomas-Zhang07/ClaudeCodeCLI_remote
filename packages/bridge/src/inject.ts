@@ -32,6 +32,35 @@ export type InjectionRefusal =
   | 'not-controllable'
   | 'session-not-idle';
 
+/**
+ * Find which of the prompts we typed matches a turn that has appeared.
+ *
+ * Typing into a terminal is not delivery — Claude Code queues input mid-turn
+ * and can discard what it queued — so the transcript is the only proof. Matching
+ * on the text is imperfect by nature, so the rules are deliberately narrow:
+ * exact after normalising whitespace, or a long shared prefix for the case
+ * where the parser truncated the turn before storing it. A truncation marker
+ * must not read as a mismatch and leave a delivered prompt looking lost.
+ *
+ * @returns the index of the match, or -1.
+ */
+export function matchDeliveredTurn(
+  waiting: readonly { text: string }[],
+  turnText: string,
+): number {
+  const normalise = (value: string): string => value.trim().replace(/\s+/g, ' ');
+  const turn = normalise(turnText);
+  if (turn.length === 0) return -1;
+
+  return waiting.findIndex((entry) => {
+    const sent = normalise(entry.text);
+    if (sent.length === 0) return false;
+    if (sent === turn) return true;
+    // Long enough that a shared prefix cannot be coincidence.
+    return sent.length > 40 && turn.length > 40 && sent.slice(0, 200) === turn.slice(0, 200);
+  });
+}
+
 export interface InjectionContext {
   /** The operator has allowed prompts at all. */
   injectionEnabled: boolean;

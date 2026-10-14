@@ -18,6 +18,7 @@ import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promise
 import { join } from 'node:path';
 
 import {
+  type InjectionState,
   type NormalizedEvent,
   type RelayIndex,
   type RegistryEntry,
@@ -34,7 +35,7 @@ import {
   type ControlledSession,
 } from './control.js';
 import { parseInboundPrompt, verifyPrompt, type VerifyFailure } from './inbound.js';
-import { injectionRefusal } from './inject.js';
+import { injectionRefusal, matchDeliveredTurn } from './inject.js';
 import { RelaySync } from './sync.js';
 import {
   readJson,
@@ -124,6 +125,15 @@ export class Bridge {
   #controlledPids = new Map<number, ControlledSession>();
   #publishTimer: NodeJS.Timeout | null = null;
   #publishing = false;
+  /**
+   * Prompts typed into a session, awaiting evidence that they landed.
+   *
+   * Typing into a terminal is not delivery: Claude Code queues input mid-turn
+   * and can discard what it queued, so the only proof a prompt arrived is it
+   * appearing as a turn in the transcript. Until then the honest word is
+   * "typed", not "delivered".
+   */
+  #awaitingDelivery = new Map<string, { promptId: string; text: string; at: number }[]>();
   /** A trigger arrived while a publish was already running. */
   #republish = false;
 
@@ -373,18 +383,56 @@ export class Bridge {
     if (!reply) return refuse('rejected', 'session-unreachable');
     if (reply.type !== 'accepted') return refuse('rejected', reply.reason ?? 'refused');
 
-    process.stderr.write(`[relay] delivered ${prompt.promptId} to pid ${entry.pid}\n`);
+    process.stderr.write(`[relay] typed ${prompt.promptId} into pid ${entry.pid}\n`);
+
+    // Watch for it coming back as a turn.
+    const waiting = this.#awaitingDelivery.get(prompt.sessionId) ?? [];
+    waiting.push({ promptId: prompt.promptId, text: prompt.text, at: Date.now() });
+    this.#awaitingDelivery.set(prompt.sessionId, waiting);
+
     // 'accepted' means it reached the terminal, not that Claude acted on it.
-    // Only the transcript can confirm that, so the wording stays honest.
+    // Only the transcript can confirm that, and it usually does so within a
+    // second or two — so this is a waypoint, not the final word.
     await this.#recordInjection(prompt.promptId, prompt.sessionId, 'accepted', 'typed into the session');
     await this.#relay?.markConsumed([inboundName]).catch(() => {});
+  }
+
+  /**
+   * Match a transcript turn against prompts we typed, and report the ones that
+   * arrived.
+   *
+   * Comparison is on normalised text, with a long-prefix fallback because the
+   * parser truncates long prompts — a truncation marker must not read as a
+   * mismatch and leave a delivered prompt looking lost.
+   */
+  async #confirmDelivery(sessionId: string, turnText: string): Promise<void> {
+    let waiting = this.#awaitingDelivery.get(sessionId);
+    if (!waiting || waiting.length === 0) return;
+
+    // Drop anything old enough that it will never arrive, so the list cannot
+    // grow without bound over a long session.
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    waiting = waiting.filter((entry) => entry.at >= cutoff);
+    this.#awaitingDelivery.set(sessionId, waiting);
+    if (waiting.length === 0) return;
+
+    const index = matchDeliveredTurn(waiting, turnText);
+    if (index === -1) return;
+
+    const [arrived] = waiting.splice(index, 1);
+    if (arrived) {
+      await this.#recordInjection(arrived.promptId, sessionId, 'delivered', 'reached the session');
+    }
   }
 
   /** Surface a prompt's fate in the session timeline, so the phone sees it. */
   async #recordInjection(
     promptId: string,
     sessionId: string | null,
-    state: 'accepted' | 'rejected',
+    // The full set, not just the two this started with: a prompt typed into a
+    // session is later confirmed as delivered by the transcript, and that
+    // upgrade is the difference between "we typed it" and "it arrived".
+    state: InjectionState,
     detail: VerifyFailure | string,
   ): Promise<void> {
     if (!sessionId) return;
@@ -685,6 +733,11 @@ export class Bridge {
     for (const event of events) {
       await runtime.chunker.append(event);
       if (!fromAgent) runtime.lastMainKind = event.kind;
+
+      // A prompt we typed has shown up as a turn, so it genuinely arrived.
+      if (!fromAgent && event.kind === 'user_prompt') {
+        await this.#confirmDelivery(runtime.sessionId, event.text);
+      }
       this.#relayDirty = true;
       // Appending moves the chunk range, and `head.json` is what tells the
       // reader about it. Leaving this to the aggregator's own dirty flag would

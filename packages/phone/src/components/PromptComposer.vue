@@ -52,12 +52,27 @@ const canSend = computed(
     !tooLong.value,
 );
 
+/**
+ * What to say about a prompt that was sent.
+ *
+ * A refusal carries the PC's own reason, which is the whole value of the
+ * acknowledgment — "rejected" on its own tells you nothing you can act on, and
+ * sends you looking for an answer elsewhere.
+ */
 function statusLabel(prompt: OutboundPrompt): { label: string; tone: string } {
+  if (prompt.acknowledged === 'rejected') {
+    return { label: prompt.ackDetail ?? 'the PC refused this prompt', tone: 'rejected' };
+  }
+  if (prompt.acknowledged === 'delivered') {
+    return { label: 'reached the session', tone: 'delivered' };
+  }
   if (prompt.acknowledged) {
     return { label: prompt.acknowledged, tone: prompt.acknowledged };
   }
   if (promptExpired(prompt, now.value)) {
-    return { label: 'no acknowledgement seen', tone: 'expired' };
+    // Silence is not a refusal: the PC may simply not have reached it yet, so
+    // say what is known rather than implying something went wrong.
+    return { label: 'no word from the PC yet', tone: 'expired' };
   }
   return { label: 'sent, awaiting acknowledgement', tone: 'pending' };
 }
