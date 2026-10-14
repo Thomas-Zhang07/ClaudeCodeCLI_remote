@@ -43,6 +43,17 @@ async function readManifest(): Promise<ChunkManifest> {
   return JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')) as ChunkManifest;
 }
 
+/** Highest chunk number with a file on disk, for assertions about numbering. */
+async function highestChunkFile(): Promise<number> {
+  const files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'));
+  return Math.max(...files.map((f) => Number.parseInt(/events-(\d+)/.exec(f)![1]!, 10)));
+}
+
+/** Leave a manifest the writer cannot parse, without touching the chunks. */
+async function corruptManifest(): Promise<void> {
+  await writeFile(join(dir, 'manifest.json'), '{ this is not json at all');
+}
+
 describe('crc32', () => {
   it('matches the known digest for a fixed input', () => {
     // Standard check value.
@@ -676,6 +687,175 @@ describe('ChunkWriter', () => {
       const second = new ChunkWriter({ dir });
       await second.open('sess-1');
       expect(second.chunkNumber).toBe(highest + 1);
+    });
+  });
+
+  /**
+   * The manifest is the writer's bookkeeping, not the record. A sealed chunk
+   * carries its own proof of completeness, so losing the manifest must not cost
+   * the chunks: leaving the sealed list empty moved `chunkFirst` above every
+   * chunk still on disk, so the reader was never told to assemble them with the
+   * new events and retention could no longer see them to prune them.
+   *
+   * What can be recovered is bounded by the same rule the reader applies. The
+   * range has to be walkable end to end — the phone fetches `chunkFirst..
+   * chunkLast` in order and stops at the first chunk it cannot parse — so a
+   * chunk that cannot be vouched for ends the run the writer advertises, and
+   * everything below it is left out rather than advertised around.
+   */
+  describe('recovery from a corrupt manifest', () => {
+    it('rebuilds the sealed list from the chunk files', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 12; i++) await w.append(event(i, 60));
+      await w.finish();
+      const before = w.range;
+      expect(before.chunkFirst).toBe(1);
+      expect(before.chunkLast).toBeGreaterThan(1);
+
+      await corruptManifest();
+
+      const recovered = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await recovered.open('sess-1');
+
+      // The whole established series is back, not just the numbering.
+      expect(recovered.range.chunkFirst).toBe(before.chunkFirst);
+      expect(recovered.range.chunkLast).toBe(before.chunkLast);
+      expect(recovered.range.firstSeq).toBe(before.firstSeq);
+      expect(recovered.range.lastSeq).toBe(before.lastSeq);
+      expect(recovered.sealCount()).toBe(before.chunkLast - before.chunkFirst + 1);
+      // Provable rather than guessed: retained from chunk 1 means nothing has
+      // ever been pruned.
+      expect(recovered.range.droppedEvents).toBe(0);
+
+      // Every chunk it now advertises is sealed and holds exactly what it says.
+      for (let n = recovered.range.chunkFirst; n <= recovered.range.chunkLast; n++) {
+        const lines = (await readFile(join(dir, chunkFilename(n)), 'utf8')).trim().split('\n');
+        const sentinel = JSON.parse(lines.at(-1)!);
+        expect(sentinel.t).toBe('chunk_end');
+        expect(sentinel.lines).toBe(lines.length - 1);
+      }
+
+      // And the recovered list is written back on the next seal, so the next
+      // restart reads it instead of scanning again — and the sequence position
+      // continues from the last event on disk rather than restarting behind it.
+      await recovered.append(event(13, 60));
+      await recovered.finish();
+      const manifest = await readManifest();
+      expect(manifest.chunks[0]!.n).toBe(before.chunkFirst);
+      expect(manifest.chunks.at(-1)!.lastSeq).toBe(13);
+    });
+
+    it('keeps an unsealed trailing chunk out of the advertised range', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 6; i++) await w.append(event(i, 60));
+      await w.finish();
+      const highest = await highestChunkFile();
+
+      // A crash left the next chunk half-written: events, no sentinel.
+      const partialPath = join(dir, chunkFilename(highest + 1));
+      await appendFile(partialPath, `${JSON.stringify(event(7, 60))}\n`);
+      const partial = await readFile(partialPath, 'utf8');
+
+      await corruptManifest();
+
+      const recovered = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await recovered.open('sess-1');
+
+      // Unsealed is not corruption — the reader discards it, which is the whole
+      // point of the sentinel — but it is not a recovered entry either. It is
+      // skipped, and its number is never reused.
+      expect(recovered.chunkNumber).toBe(highest + 2);
+      expect(recovered.range.chunkFirst).toBeGreaterThan(highest + 1);
+      expect(recovered.range.chunkLast).toBeLessThan(recovered.range.chunkFirst);
+
+      // Nor may the range reach back over it later. The reader stops at the
+      // first chunk it cannot parse, so a range spanning this file would strand
+      // every chunk above it for as long as the session lives.
+      await recovered.append(event(8, 60));
+      await recovered.finish();
+      expect(recovered.range.chunkFirst).toBeGreaterThan(highest + 1);
+
+      // Left exactly as found: those events are real, they are the only copy,
+      // and discarding them is not this recovery's call to make.
+      expect(await readFile(partialPath, 'utf8')).toBe(partial);
+    });
+
+    it('drops a chunk whose sentinel does not validate, and starts the range above it', async () => {
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 8; i++) await w.append(event(i, 60));
+      await w.finish();
+      const highest = await highestChunkFile();
+      expect(highest).toBeGreaterThan(3);
+
+      // A sealed chunk that does not check out: bit rot, or the split brain the
+      // heartbeat lock now prevents. The phone refuses it, so the writer must
+      // not hand it over — and the checksum is what catches it, since the file
+      // still *looks* complete.
+      const victim = 3;
+      const victimPath = join(dir, chunkFilename(victim));
+      const lines = (await readFile(victimPath, 'utf8')).trim().split('\n');
+      const sentinel = JSON.parse(lines.at(-1)!);
+      sentinel.crc32 = sentinel.crc32 === 'deadbeef' ? '00000000' : 'deadbeef';
+      lines[lines.length - 1] = JSON.stringify(sentinel);
+      const damaged = `${lines.join('\n')}\n`;
+      await writeFile(victimPath, damaged);
+
+      await corruptManifest();
+
+      const recovered = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await recovered.open('sess-1');
+
+      // The run kept is the contiguous one above the break. Keeping the chunks
+      // below it would put the damaged file inside the advertised range, and the
+      // reader stops there — so they would be unreachable regardless.
+      expect(recovered.range.chunkFirst).toBe(victim + 1);
+      expect(recovered.range.chunkLast).toBe(highest);
+      expect(recovered.sealCount()).toBe(highest - victim);
+
+      // The front is gone, and the phone is still told so rather than left to
+      // read a timeline that quietly begins partway through. The count was in
+      // the manifest, so what is reported is the bound the files can prove.
+      expect(recovered.range.droppedEvents).toBeGreaterThan(0);
+
+      for (let n = victim + 1; n <= highest; n++) {
+        const kept = (await readFile(join(dir, chunkFilename(n)), 'utf8')).trim().split('\n');
+        expect(JSON.parse(kept.at(-1)!).t).toBe('chunk_end');
+      }
+
+      // The damaged file is left as found — it is not the writer's to delete.
+      expect(await readFile(victimPath, 'utf8')).toBe(damaged);
+    });
+
+    it('appends above the highest chunk file, leaving the recovered chunks byte-identical', async () => {
+      // A rebuilt sealed list is not licence to rewrite anything: the reader is
+      // entitled to believe a sealed chunk never changes, and its cache — keyed
+      // by chunk number — depends on exactly that.
+      const w = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await w.open('sess-1');
+      for (let i = 1; i <= 6; i++) await w.append(event(i, 60));
+      await w.finish();
+      const highest = await highestChunkFile();
+
+      const digests = new Map<string, string>();
+      for (const file of (await readdir(dir)).filter((f) => f.endsWith('.jsonl'))) {
+        digests.set(file, sha256(await readFile(join(dir, file))));
+      }
+
+      await corruptManifest();
+
+      const recovered = new ChunkWriter({ dir, maxChunkBytes: 120 });
+      await recovered.open('sess-1');
+      await recovered.append(event(7, 60));
+      await recovered.finish();
+
+      for (const [file, digest] of digests) {
+        expect(sha256(await readFile(join(dir, file))), file).toBe(digest);
+      }
+      expect(recovered.range.chunkLast).toBe(highest + 1);
+      expect(existsSync(join(dir, chunkFilename(highest + 1)))).toBe(true);
     });
   });
 });

@@ -9,6 +9,12 @@
  *  - **A chunk is only advertised once it carries a terminating sentinel.** The
  *    open chunk is deliberately incomplete, so a crash mid-write leaves
  *    something the reader discards rather than half-believes.
+ *  - **The advertised range is contiguous and parseable end to end.** The reader
+ *    walks `chunkFirst..chunkLast` in order and stops at the first chunk it
+ *    cannot parse, so a hole inside the range hides every chunk above it —
+ *    including the newest ones. Where the range comes from the files rather than
+ *    the manifest (`#recoverSealed`), it therefore begins after the last chunk
+ *    that could not be vouched for rather than spanning it.
  *  - **Retention deletes the oldest chunk rather than compacting.** An archive
  *    file trimmed from the front would be rewritten on every pass, and a
  *    rewritten file can never be cached by the reader — which is the whole
@@ -334,8 +340,9 @@ export class ChunkWriter {
         // unguarded path for as long as the series lives.
         this.#generation = validGeneration(parsed.generation) ?? mintGeneration();
       } else {
-        // A corrupt manifest is recoverable: start numbering above whatever chunk
-        // files exist, so nothing already written is overwritten.
+        // A corrupt manifest is recoverable, and only partly from the manifest
+        // itself: start numbering above whatever chunk files exist, so nothing
+        // already written is overwritten.
         //
         // Above the *files*, not at 1. Resetting to 1 re-enters the chunk the
         // previous run was writing, so sealed history the phone has already
@@ -343,13 +350,44 @@ export class ChunkWriter {
         // has no way to notice, because immutability is the property it is
         // entitled to assume.
         //
+        // Above the files rather than above the *sealed* files, which is the
+        // distinction that matters if the highest file is one that cannot be
+        // vouched for: its number is skipped rather than re-entered. A chunk
+        // whose sentinel is missing is one the previous run was still writing,
+        // and the manifest that would say how many events it had already taken
+        // is the very thing that is unreadable — so it is left alone and the
+        // series continues past it. Nothing already written is touched, which is
+        // the whole of what this rule is for.
+        //
+        // The sealed list itself is not lost with the manifest — the chunk files
+        // carry their own proof of completeness — so it is rebuilt from them
+        // rather than left empty. Empty is what made this recovery expensive:
+        // `chunkFirst` moved above every chunk still on disk, so the reader was
+        // never told to assemble them with the new events and retention could no
+        // longer see them to prune them. See `#recoverSealed`.
+        //
         // The old token is unrecoverable here, so a new one is minted. That
         // discards cached copies of chunks which did not change — waste, but
         // never wrong, and the alternative is a reader trusting a token whose
         // meaning this writer can no longer vouch for.
-        this.#sealed = [];
-        this.#sealedBytes = 0;
+        this.#sealed = await this.#recoverSealed(onDisk);
+        this.#sealedBytes = this.#sealed.reduce((sum, c) => sum + c.bytes, 0);
         this.#chunk = onDisk + 1;
+        // The one number the files cannot give back: `droppedEvents` counted the
+        // events retention had deleted, and only the manifest ever recorded it.
+        // Reporting 0 would be a claim of completeness that the files on disk
+        // already refute — retention cuts from the front only, so a series that
+        // no longer starts at chunk 1 has certainly lost events — and the phone
+        // reads "0" as "nothing was pruned" and drops its explanation for a
+        // timeline that begins partway through (Timeline.vue only prints the note
+        // above zero). So report what is provable instead of what is unknown:
+        // every chunk number below the write position was used by a chunk
+        // holding at least one event, because an empty chunk is never sealed, so
+        // the numbers the recovered series does not account for bound the loss
+        // from below. A true lower bound is a smaller number than the truth, but
+        // it keeps the fact of the pruning — the part the reader acts on — and
+        // never asserts a figure the bridge cannot support.
+        this.#droppedEvents = this.#chunk - 1 - this.#sealed.length;
         this.#generation = mintGeneration();
       }
     } else {
@@ -411,6 +449,140 @@ export class ChunkWriter {
       if (match) highest = Math.max(highest, Number.parseInt(match[1]!, 10));
     }
     return highest;
+  }
+
+  /**
+   * Rebuild the sealed list from the chunk files, for when the manifest cannot
+   * be read.
+   *
+   * A chunk file carries its own proof of completeness — the terminating
+   * sentinel, written last, naming the chunk and the line count and signed over
+   * the sequence the chunk starts at — so a scan can recover everything the
+   * manifest held except the dropped count. A file that cannot produce that
+   * proof is one the *reader* would refuse as well, and the writer must not
+   * advertise what the reader cannot parse.
+   *
+   * Only the contiguous run ending at the highest chunk file is taken: the walk
+   * goes down from the top and stops at the first number that cannot be vouched
+   * for, whether that is a file that fails its sentinel or one that is missing
+   * altogether. This is the reader's own constraint, not a preference — the
+   * phone fetches `chunkFirst..chunkLast` in order and breaks at the first chunk
+   * it cannot parse (`relay.ts`, `parseChunk`), so a hole anywhere inside the
+   * advertised range would hide every chunk above it, including the ones this
+   * writer is about to add. A range that started below the break would therefore
+   * produce exactly the outage the rebuild is meant to end.
+   *
+   * The cost of that rule is real and is the reason it needs stating: when the
+   * highest file is the untrustworthy one — the crash mid-chunk case — the run
+   * above the break is empty, so nothing is advertised at all until new events
+   * arrive. A shorter range is the honest answer there, because the files below
+   * the break cannot be reached through the range without the reader stopping on
+   * the break first; leaving them out of the series also means leaving them out
+   * of retention, which is why the abandoned files stay on disk untouched
+   * (deleting them is not this writer's call, and they are the only copy of
+   * whatever they hold).
+   */
+  async #recoverSealed(highest: number): Promise<ChunkEntry[]> {
+    const recovered: ChunkEntry[] = [];
+    for (let n = highest; n >= 1; n--) {
+      const entry = await this.#sealedChunk(n);
+      if (entry === null) break;
+      recovered.unshift(entry);
+    }
+    return recovered;
+  }
+
+  /**
+   * The manifest entry for chunk `n`, or null when the file cannot be vouched
+   * for.
+   *
+   * The test is deliberately the one the reader applies, because a chunk this
+   * accepts and the reader rejects is a chunk advertised and then refused: the
+   * sentinel must be present, must name this chunk's number, and must agree with
+   * the file's own contents. The line count is checked as well as the checksum
+   * because `lines === events.length` is the stronger of the two — the checksum
+   * is derived from the same count, so it cannot catch a chunk whose events were
+   * replaced wholesale, and it covers truncation rather than corruption (see the
+   * note on the sentinel's CRC in the docs).
+   */
+  async #sealedChunk(n: number): Promise<ChunkEntry | null> {
+    const path = join(this.#dir, chunkFilename(n));
+
+    let raw: Buffer;
+    let size: number;
+    try {
+      // Size from `stat` rather than `raw.length` so the recorded byte count is
+      // the file's size on disk — the number retention budgets against and the
+      // reader is told it is fetching — not merely what this read happened to
+      // see.
+      raw = await readFile(path);
+      size = (await stat(path)).size;
+    } catch {
+      return null; // Unreadable, or gone: either way nothing here to advertise.
+    }
+
+    const lines = raw.toString('utf8').split('\n');
+    let last = lines.length - 1;
+    while (last >= 0 && lines[last]!.trim() === '') last--;
+    if (last < 0) return null; // Empty: a chunk nothing has been written to yet.
+
+    let sentinel: ChunkEndSentinel;
+    try {
+      const parsed = JSON.parse(lines[last]!.trim()) as Partial<ChunkEndSentinel>;
+      if (
+        parsed.t !== 'chunk_end' ||
+        typeof parsed.n !== 'number' ||
+        typeof parsed.lines !== 'number' ||
+        typeof parsed.crc32 !== 'string'
+      ) {
+        return null;
+      }
+      sentinel = parsed as ChunkEndSentinel;
+    } catch {
+      // No sentinel at all: the chunk was still open when the process died, or
+      // its last line is torn. Unsealed is not corruption — it is the state the
+      // header calls deliberately incomplete — but it is not an entry either.
+      return null;
+    }
+
+    // The filename is the only place the number is recorded independently of the
+    // file's contents, so it is what proves this is the chunk it claims to be
+    // rather than a copy of another one under a different name.
+    if (sentinel.n !== n) return null;
+
+    let firstSeq: number | null = null;
+    let events = 0;
+    for (let i = 0; i < last; i++) {
+      const text = lines[i]!.trim();
+      if (text === '') continue;
+
+      let parsed: { seq?: unknown };
+      try {
+        parsed = JSON.parse(text) as { seq?: unknown };
+      } catch {
+        return null; // A line that does not parse is one the reader cannot use.
+      }
+      // No `t` check: only the sentinel is ever written without a sequence, so a
+      // non-numeric `seq` means the line is not an event.
+      if (typeof parsed.seq !== 'number') return null;
+      if (firstSeq === null) firstSeq = parsed.seq;
+      events++;
+    }
+
+    // A sealed chunk always holds at least one event — `seal()` refuses an empty
+    // one — so a sentinel over no events is not a chunk this writer wrote.
+    if (firstSeq === null) return null;
+    if (events !== sentinel.lines) return null;
+    if (sentinel.crc32 !== crc32(Buffer.from(`${firstSeq}:${sentinel.lines}`))) return null;
+
+    return {
+      n,
+      sha256: sha256(raw),
+      bytes: size,
+      firstSeq,
+      lastSeq: firstSeq + sentinel.lines - 1,
+      lines: sentinel.lines,
+    };
   }
 
   /**
