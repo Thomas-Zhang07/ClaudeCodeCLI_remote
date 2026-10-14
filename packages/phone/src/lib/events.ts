@@ -156,7 +156,7 @@ export interface Assembled {
  * the same verdict on every poll.
  *
  * Sorting by sequence repairs the reordering and leaves only real absence to
- * report, so a hole in the strip now means the record has one.
+ * report, so a hole in the feed now means the record has one.
  *
  * Chunks are sorted by `n` because parallel fetches can land in any order, and
  * the events are sorted for exactly the same reason one level down.

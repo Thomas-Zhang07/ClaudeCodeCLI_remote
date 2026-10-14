@@ -379,7 +379,7 @@ export class ChunkWriter {
         // already refute — retention cuts from the front only, so a series that
         // no longer starts at chunk 1 has certainly lost events — and the phone
         // reads "0" as "nothing was pruned" and drops its explanation for a
-        // timeline that begins partway through (Timeline.vue only prints the note
+        // record that begins partway through (Chat.vue only prints the note
         // above zero). So report what is provable instead of what is unknown:
         // every chunk number below the write position was used by a chunk
         // holding at least one event, because an empty chunk is never sealed, so

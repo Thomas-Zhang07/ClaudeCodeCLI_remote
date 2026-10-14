@@ -4,13 +4,13 @@
    The subject is a continuous machine log: numbered events, timestamps, turns,
    counters, arriving one after another. That is a chart recorder, not a
    dashboard — so the surface is paper, the marks are ink, and the numbers sit
-   in a ruled channel.
+   in a ruled table.
 
    Six named values, and nothing else carries a hue:
 
      paper  the stock           cool green-grey, an engineering pad
      plate  a raised face       the instrument panel, notices, fields
-     rule   every hairline      the strip's channel, panel edges, table rules
+     rule   every hairline      the feed's time rules, panel edges, table rules
      ink    text and the trace
      ink-2  the trace, faint    secondary text
      signal A PERSON IS NEEDED  waiting, attention. Reserved; never decoration
@@ -27,7 +27,7 @@
   --paper: #171a18;
   --plate: #212520;
   --rule: #333a33;
-  /* One step heavier: the rule that opens the strip, and the foot of a ledger. */
+  /* One step heavier: the rail beside a notice, and the foot of a ledger. */
   --rule-strong: #4b5449;
   --ink: #dfe3d7;
   --ink-2: #9aa394;
@@ -36,9 +36,8 @@
   /* Content ink, used inside an expanded diff and nowhere else. */
   --add-ink: #8fb07e;
 
-  --gutter: 42px;
   --tap: 44px;
-  /* The page gutter. The strip bleeds by exactly this much, so the two must
+  /* The page gutter. The composer bleeds by exactly this much, so the two must
      come from one place. */
   --page-pad: 12px;
   /* A sans `ch` is the width of `0`, which is wider than the average letter,

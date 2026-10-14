@@ -20,6 +20,14 @@ const props = defineProps<{
    * never acknowledged — with nothing to explain why.
    */
   injectionEnabled: boolean;
+  /**
+   * Whether the session is over.
+   *
+   * An ended session is not controllable, so it lands in the same branch as a
+   * session the PC never owned — and that branch tells the reader to start it
+   * with `ccr`, which is advice about a session they have just closed.
+   */
+  ended: boolean;
 }>();
 
 const now = useNow(15_000);
@@ -112,7 +120,14 @@ async function submit(): Promise<void> {
   <section class="composer">
     <!-- Refusing to draw a text box is the point: a prompt written into a relay
          nobody reads looks exactly like one that worked. -->
-    <div v-if="!controllable" class="gate">
+    <div v-if="ended" class="gate">
+      <p class="gate-kind">ended</p>
+      <p class="gate-text">
+        This session is over. Anything written for it now has nothing on the other end to run it.
+      </p>
+    </div>
+
+    <div v-else-if="!controllable" class="gate">
       <p class="gate-kind">read-only</p>
       <p class="gate-text">
         This session is being watched, not driven. Start it with <code>ccr</code> on the PC to be
@@ -198,8 +213,8 @@ async function submit(): Promise<void> {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  /* Bleeds to the edges, as the strip does, so the record cannot be seen past it
-     while it scrolls underneath. */
+  /* Bleeds to the edges, so the record cannot be seen past it while it scrolls
+     underneath. */
   margin: 24px calc(var(--page-pad) * -1) 0;
   padding: 10px var(--page-pad) calc(10px + env(safe-area-inset-bottom, 0px));
   background: var(--plate);

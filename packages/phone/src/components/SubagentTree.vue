@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 
+import { countAgents, flattenAgents } from '@/lib/agents';
 import type { SubagentNode } from '@/types';
 
 import SubagentBranch from './SubagentBranch.vue';
@@ -13,7 +14,7 @@ const props = defineProps<{ nodes: SubagentNode[] }>();
  * is recovered from `parentAgentId` rather than silently disappearing.
  */
 const roots = computed<SubagentNode[]>(() => {
-  const all = flatten(props.nodes);
+  const all = flattenAgents(props.nodes);
   if (all.length === 0) return props.nodes;
 
   const childIds = new Set<string>();
@@ -26,21 +27,9 @@ const roots = computed<SubagentNode[]>(() => {
   return all.filter((node) => !node.parentAgentId || !childIds.has(node.agentId));
 });
 
-const total = computed(() => flatten(props.nodes).length);
-const running = computed(() => flatten(props.nodes).filter((node) => node.status === 'running').length);
-
-function flatten(nodes: readonly SubagentNode[]): SubagentNode[] {
-  const out: SubagentNode[] = [];
-  const walk = (list: readonly SubagentNode[]): void => {
-    for (const node of list) {
-      if (!node || typeof node !== 'object') continue;
-      out.push(node);
-      if (Array.isArray(node.children)) walk(node.children);
-    }
-  };
-  walk(nodes);
-  return out;
-}
+const counted = computed(() => countAgents(props.nodes));
+const total = computed(() => counted.value.total);
+const running = computed(() => counted.value.running);
 </script>
 
 <template>
