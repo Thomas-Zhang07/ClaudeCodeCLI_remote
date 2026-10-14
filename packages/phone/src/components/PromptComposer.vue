@@ -28,6 +28,16 @@ const sending = ref(false);
 const notice = ref<{ kind: 'ok' | 'error'; message: string } | null>(null);
 const cryptoReady = webCryptoAvailable();
 
+/**
+ * The history is folded away by default.
+ *
+ * The composer is pinned to the foot of the screen, so whatever is in it is paid
+ * for on every screenful of the record — and up to twenty past prompts, each
+ * several lines, would cost more than the thing being read. The count stays
+ * visible, because "did that land?" is the question it answers.
+ */
+const showHistory = ref(false);
+
 const outbound = computed<OutboundPrompt[]>(() => outboundFor(props.sessionId));
 
 const byteLength = computed(() => new TextEncoder().encode(text.value.trim()).length);
@@ -121,7 +131,7 @@ async function submit(): Promise<void> {
     <template v-else>
       <textarea
         v-model="text"
-        rows="3"
+        rows="2"
         placeholder="Write a prompt for this session"
         aria-label="Prompt"
         :disabled="sending"
@@ -148,9 +158,19 @@ async function submit(): Promise<void> {
       </p>
     </template>
 
-    <div v-if="outbound.length > 0" class="outbound">
-      <p class="outbound-head">sent from this phone</p>
-      <ul>
+    <div v-if="outbound.length > 0" class="history">
+      <!-- The same on/off vocabulary the record's own toggle uses, so the two
+           controls in this app read as the same kind of thing. -->
+      <button
+        class="history-toggle"
+        type="button"
+        :aria-expanded="showHistory"
+        @click="showHistory = !showHistory"
+      >
+        sent from this phone {{ showHistory ? 'on' : 'off' }}
+      </button>
+
+      <ul v-if="showHistory">
         <li v-for="prompt in outbound" :key="prompt.promptId" :class="`st-${statusLabel(prompt).tone}`">
           <p class="line1">
             <span class="state">{{ statusLabel(prompt).label }}</span>
@@ -169,13 +189,28 @@ async function submit(): Promise<void> {
 
 <style scoped>
 .composer {
+  /* Pinned to the foot of the session screen. Everything above it scrolls; this
+     does not, because having to reach the bottom of a long transcript before you
+     can type into it is the thing being fixed here. */
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-top: 24px;
-  padding-top: 14px;
+  /* Bleeds to the edges, as the strip does, so the record cannot be seen past it
+     while it scrolls underneath. */
+  margin: 24px calc(var(--page-pad) * -1) 0;
+  padding: 10px var(--page-pad) calc(10px + env(safe-area-inset-bottom, 0px));
+  background: var(--plate);
   border-top: 1px solid var(--rule-strong);
-  scroll-margin-top: 60px;
+}
+
+.composer textarea {
+  /* A long prompt scrolls inside the box rather than pushing the record off the
+     screen above it. */
+  max-height: 30dvh;
+  resize: none;
 }
 
 /* --- gates ---------------------------------------------------------------- */
@@ -252,29 +287,39 @@ async function submit(): Promise<void> {
 
 /* --- what we have sent ---------------------------------------------------- */
 
-.outbound {
-  margin-top: 6px;
+.history {
   border-top: 1px solid var(--rule);
-  padding-top: 10px;
+  padding-top: 8px;
 }
 
-.outbound-head {
-  margin: 0 0 6px;
+.history-toggle {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink-2);
   font-family: var(--mono);
   font-size: 10px;
-  color: var(--ink-2);
+  cursor: pointer;
 }
 
-.outbound ul {
+.history-toggle:hover {
+  color: var(--ink);
+}
+
+.history ul {
   list-style: none;
-  margin: 0;
+  margin: 10px 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* Bounded too: opening the history must not be able to fill the screen
+     either, or the pinning buys nothing. */
+  max-height: 40dvh;
+  overflow-y: auto;
 }
 
-.outbound li {
+.history li {
   padding-left: 10px;
   border-left: 2px solid var(--rule-strong);
   max-width: var(--measure);

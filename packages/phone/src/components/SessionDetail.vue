@@ -89,15 +89,15 @@ const permissionDialog = computed(() => {
 const dropped = computed(() => detail.value?.pruned?.droppedEvents ?? 0);
 
 /**
- * The composer lives at the foot of a long page, which is the wrong end of it
- * when the machine is blocked on a person.
+ * Put the cursor in the composer.
+ *
+ * This used to scroll the page to the foot of it, which was the wrong end of a
+ * long record when the machine was blocked on a person. The composer is pinned
+ * to the bottom of the screen now, so it is already in view and the only thing
+ * left to do is focus it.
  */
 function toComposer(): void {
-  const field = document.getElementById('composer');
-  if (!field) return;
-  const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  field.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'start' });
-  field.querySelector('textarea')?.focus({ preventScroll: true });
+  document.getElementById('composer')?.querySelector('textarea')?.focus({ preventScroll: true });
 }
 </script>
 

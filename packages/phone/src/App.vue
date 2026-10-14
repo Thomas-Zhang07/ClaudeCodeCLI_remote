@@ -120,7 +120,7 @@ onUnmounted(() => {
       </button>
     </header>
 
-    <main class="content">
+    <main class="content" :class="{ 'has-composer': effectiveView === 'detail' }">
       <SettingsScreen v-if="effectiveView === 'settings'" />
 
       <SessionDetail v-else-if="effectiveView === 'detail' && relay.activeSessionId" :session-id="relay.activeSessionId" />
@@ -131,22 +131,31 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/**
+ * The shell is one viewport tall and never scrolls itself; `content` is the only
+ * thing that scrolls.
+ *
+ * That is what lets the composer stay pinned to the foot of the screen. A sticky
+ * element is held in place by its nearest scrolling ancestor, so a page that
+ * scrolls as a whole gives it a moving target — and the thing being asked for is
+ * a screen where the newest event and the place to reply are both reachable
+ * without hunting for them.
+ */
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .masthead {
   display: flex;
   align-items: center;
   gap: 2px;
+  flex: none;
   padding: calc(2px + env(safe-area-inset-top, 0px)) 6px 2px;
   background: var(--plate);
   border-bottom: 1px solid var(--rule);
-  position: sticky;
-  top: 0;
-  z-index: 10;
 }
 
 .wordmark {
@@ -179,10 +188,19 @@ onUnmounted(() => {
 
 .content {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   padding: 0 var(--page-pad) 32px;
   max-width: 600px;
   width: 100%;
   margin: 0 auto;
   min-width: 0;
+}
+
+/* The composer is the floor of a session screen and carries its own spacing, so
+   the 32px above would open a gap between the bar and the bottom edge. */
+.content.has-composer {
+  padding-bottom: 0;
 }
 </style>

@@ -157,6 +157,35 @@ export class BlobCache {
     return dropped;
   }
 
+  /**
+   * Drop every entry under `prefix`.
+   *
+   * The blunt instrument, for when the reader has decided its own copy cannot be
+   * trusted rather than merely gone stale — a manual refresh. Unlike
+   * `evictExcept` there is no second prefix, so this really can empty the cache;
+   * that is the point, and only a caller that has already undertaken to refetch
+   * everything should ask for it.
+   *
+   * Returns how many entries were dropped.
+   */
+  evictPrefix(prefix: string): number {
+    if (prefix === '') return 0;
+
+    let dropped = 0;
+    for (const [key, entry] of [...this.#entries]) {
+      if (!key.startsWith(prefix)) continue;
+      this.#entries.delete(key);
+      this.#bytes -= entry.text.length;
+      dropped += 1;
+    }
+
+    if (dropped > 0) {
+      this.#dirty = true;
+      this.#schedule();
+    }
+    return dropped;
+  }
+
   /** Force a synchronous write. Also called when the tab is hidden. */
   flush(): void {
     if (this.#timer !== null) {

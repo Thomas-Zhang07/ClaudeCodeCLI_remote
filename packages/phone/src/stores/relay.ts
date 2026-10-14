@@ -944,7 +944,20 @@ export function stopPolling(): void {
   }
 }
 
-/** Force a refresh now (pull-to-refresh button, or after saving settings). */
+/**
+ * Fetch everything on screen again, from the relay rather than from the cache.
+ *
+ * The button used to call `pollOnce({ force: true })`, which refetches
+ * `subagents.json` and nothing else. An open session's chunks come from
+ * `blobCache`, whose entire purpose is never being fetched twice — so pressing it
+ * re-read the same bytes and redrew the same pixels, which is indistinguishable
+ * from a dead button.
+ *
+ * Someone reaching for a refresh is usually saying "the screen disagrees with
+ * the PC", so it has to mean "throw away what you think you know". Only the open
+ * session's chunks go, not the whole cache: every other session's entries are
+ * still correct, and refetching them would spend quota to change nothing.
+ */
 export async function refreshNow(): Promise<void> {
   if (!isConfigured.value) return;
   // A manual refresh clears the backoff: the user has decided to spend a request.
@@ -952,6 +965,15 @@ export async function refreshNow(): Promise<void> {
   throttle.until = 0;
   throttle.active = false;
   relay.consecutiveErrors = 0;
+
+  const open = relay.detail;
+  if (open !== null) {
+    // Every generation, deliberately: what is being discarded is the belief that
+    // this session's cached chunks can be trusted at all, not one series of them.
+    blobCache.evictPrefix(`${sessionDir(open.sessionId)}/`);
+    open.subagentsLoaded = false;
+  }
+
   try {
     await pollOnce({ force: true });
   } finally {

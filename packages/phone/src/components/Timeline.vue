@@ -120,6 +120,20 @@ const rows = computed(() => {
   });
 });
 
+/**
+ * Newest first.
+ *
+ * The record is written oldest to newest; it is read the other way. What you
+ * opened a session to find out is what just happened, and leaving that at the far
+ * end of a long transcript means scrolling past the whole of it to reach it.
+ *
+ * Flipped at render rather than in `slice`, so `rows` is still built in the
+ * record's own order: the margin's time marks depend on an entry's predecessor
+ * *in time*, and deciding them on the flipped list would stamp every mark
+ * against the wrong neighbour.
+ */
+const orderedRows = computed(() => [...rows.value].reverse());
+
 // A new event should not yank the reading position, but switching sessions must
 // start at the newest end.
 watch(
@@ -172,18 +186,6 @@ function flags(event: NormalizedEvent): (string | null)[] {
       </button>
     </div>
 
-    <!-- Retention, not damage: the strip simply starts later than event one. -->
-    <p v-if="droppedEvents && droppedEvents > 0" class="pruned">
-      The relay keeps a rolling window, so {{ droppedEvents }} earlier event{{
-        droppedEvents === 1 ? '' : 's'
-      }}
-      were dropped. The record is complete from here on.
-    </p>
-
-    <button v-if="hiddenCount > 0" class="more" type="button" @click="limit += PAGE">
-      show {{ Math.min(PAGE, hiddenCount) }} older, {{ hiddenCount }} held back
-    </button>
-
     <p v-if="visibleEvents.length === 0" class="quiet">
       {{
         events.length === 0
@@ -193,7 +195,26 @@ function flags(event: NormalizedEvent): (string | null)[] {
     </p>
 
     <ol v-else class="roll">
-      <template v-for="row in rows" :key="row.key">
+      <template v-for="row in orderedRows" :key="row.key">
+        <!-- Drawn above its anchor rather than below it: the record reads newest
+             first now, so the event on the far side of the hole sits *above* the
+             one the tear is anchored to. -->
+        <li v-if="row.tear" class="tear">
+          <span class="margin">
+            <span class="seq">{{ row.tear.first }}</span>
+          </span>
+          <i class="tick" aria-hidden="true"></i>
+          <p>
+            <template v-if="row.tear.count === 1">
+              The strip is torn here: event #{{ row.tear.first }} never arrived.
+            </template>
+            <template v-else>
+              The strip is torn here: {{ row.tear.count }} events from
+              #{{ row.tear.first }} never arrived.
+            </template>
+          </p>
+        </li>
+
         <li class="entry" :class="[...flags(row.event), { arriving: arriving === row.event.seq }]">
           <!-- The margin is the recorder's: the counter on top, the time scale
                under it. Nothing in the body has to announce when it happened. -->
@@ -266,25 +287,22 @@ function flags(event: NormalizedEvent): (string | null)[] {
             </div>
           </div>
         </li>
-
-        <!-- A hole in the record: the strip is torn, and the rule with it. -->
-        <li v-if="row.tear" class="tear">
-          <span class="margin">
-            <span class="seq">{{ row.tear.first }}</span>
-          </span>
-          <i class="tick" aria-hidden="true"></i>
-          <p>
-            <template v-if="row.tear.count === 1">
-              The strip is torn here: event #{{ row.tear.first }} never arrived.
-            </template>
-            <template v-else>
-              The strip is torn here: {{ row.tear.count }} events from
-              #{{ row.tear.first }} never arrived.
-            </template>
-          </p>
-        </li>
       </template>
     </ol>
+
+    <!-- Older history, and the retention that ate it, both belong below the roll
+         now: the feed runs newest first, so the far end of the record is the
+         bottom of the screen. -->
+    <button v-if="hiddenCount > 0" class="more" type="button" @click="limit += PAGE">
+      show {{ Math.min(PAGE, hiddenCount) }} older, {{ hiddenCount }} held back
+    </button>
+
+    <p v-if="droppedEvents && droppedEvents > 0" class="pruned">
+      The relay keeps a rolling window, so {{ droppedEvents }} earlier event{{
+        droppedEvents === 1 ? '' : 's'
+      }}
+      were dropped. The record is complete from here on.
+    </p>
   </section>
 </template>
 

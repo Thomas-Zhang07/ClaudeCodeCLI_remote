@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 
 import { parseTs, relativeTime } from '@/lib/format';
 import { useNow } from '@/lib/now';
@@ -9,6 +9,24 @@ import { refreshNow, relay, throttledForMs } from '@/stores/relay';
 const now = useNow(1000);
 
 const backoffMs = computed(() => throttledForMs(now.value));
+
+/**
+ * A refresh is a request the user chose to spend, and it can take a second or
+ * two on a phone — long enough that a button which looks identical before and
+ * after reads as one that does nothing at all, which is what this one used to
+ * do and why it was reported as broken.
+ */
+const refreshing = ref(false);
+
+async function refresh(): Promise<void> {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await refreshNow();
+  } finally {
+    refreshing.value = false;
+  }
+}
 
 /**
  * How long without a publish before the PC is treated as not reporting.
@@ -117,9 +135,15 @@ const detail = computed(() => {
     <span class="mark" aria-hidden="true"></span>
     <span class="phase">{{ phaseLabel }}</span>
     <span class="detail" :title="detail">{{ detail }}</span>
-    <button class="refresh" type="button" :disabled="relay.phase === 'loading'" @click="refreshNow()">
-      <span aria-hidden="true">⟳</span>
-      <span class="sr-only">Refresh now</span>
+    <button
+      class="refresh"
+      type="button"
+      :disabled="refreshing"
+      :aria-busy="refreshing"
+      @click="refresh()"
+    >
+      <span class="glyph" :class="{ turning: refreshing }" aria-hidden="true">⟳</span>
+      <span class="sr-only">{{ refreshing ? 'Refreshing' : 'Refresh now' }}</span>
     </button>
   </div>
 </template>
@@ -194,5 +218,27 @@ const detail = computed(() => {
 .refresh:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+.refresh .glyph {
+  display: inline-block;
+}
+
+/* The only motion in this app that is not the record itself moving, and it
+   answers a press: what it shows is that the press was heard. */
+.refresh .glyph.turning {
+  animation: turn 800ms linear infinite;
+}
+
+@keyframes turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .refresh .glyph.turning {
+    animation: none;
+  }
 }
 </style>
