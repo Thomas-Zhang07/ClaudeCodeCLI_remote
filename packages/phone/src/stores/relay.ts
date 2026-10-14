@@ -116,10 +116,14 @@ export interface DetailState {
   /** True while a fetch failed and a retry could still repair the stream. */
   resyncing: boolean;
   /**
-   * A hole we cannot repair by refetching — the sequence inside the loaded
-   * chunks jumps.
+   * A hole in the record that refetching cannot repair: a sequence number is
+   * absent from the chunks, or a chunk would not read at all.
+   *
+   * No longer withholds anything. The strip marks the hole and shows everything
+   * either side of it, so one missing event costs that event rather than the
+   * rest of the session.
    */
-  gap: { afterSeq: number; reason: GapReason } | null;
+  gap: { afterSeq: number; reason: GapReason; missing: number | null } | null;
   /** Chunk numbers in the retained range that are not loaded yet. */
   pendingChunks: number[];
   /**
@@ -588,11 +592,16 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       loaded.push({ n, events: parsed.events });
     }
 
+    // --- assemble ---------------------------------------------------------
+    // Before the verdict below rather than after it: the verdict is described in
+    // terms of where the readable record ends, and the highest sequence is that.
+    const assembled: Assembled = assembleStream(loaded);
+
     // --- interpret what stopped us ----------------------------------------
     let gap: DetailState['gap'] = null;
     let resyncing = false;
     let inFlight = false;
-    const lastLoadedSeq = loaded.at(-1)?.events.at(-1)?.seq ?? 0;
+    const lastLoadedSeq = assembled.lastSeq ?? 0;
 
     if (blocked !== null && blocked.kind === 'unavailable') {
       detail.blockedPolls += 1;
@@ -605,7 +614,7 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       detail.blockedPolls = 0;
       if (detail.resyncAttempts >= RESYNC_ATTEMPTS) {
         // Already given up on this hole. Keep reporting it without looping.
-        gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete' };
+        gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete', missing: null };
       } else {
         detail.resyncFrom =
           detail.resyncFrom === null ? blocked.n : Math.min(detail.resyncFrom, blocked.n);
@@ -614,7 +623,7 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
           // A couple of refetches have not fixed it; report the hole rather than
           // loop on it forever.
           detail.resyncFrom = null;
-          gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete' };
+          gap = { afterSeq: lastLoadedSeq, reason: 'chunk-incomplete', missing: null };
         } else {
           resyncing = true;
         }
@@ -628,26 +637,25 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
       inFlight = blocked !== null;
     }
 
-    // A jump in the sequence is only a hole when the reader has what it asked
-    // for. While chunks remain unfetched — a catch-up after the phone slept, a
+    // A missing sequence is only a hole when the reader has what it asked for.
+    // While chunks remain unfetched — a catch-up after the phone slept, a
     // just-pushed chunk the Contents API has not caught up with — their absence
     // is the competing explanation, and the honest word is "catching up", not
     // "torn". A torn strip is a claim about the record; a reader that has simply
     // not finished fetching has no standing to make it.
     //
     // An unsealed newest chunk is deliberately *not* one of these cases: it
-    // means everything sealed has been loaded, so a jump there is real damage
+    // means everything sealed has been loaded, so a hole there is real damage
     // and must be reported.
+    //
+    // Only genuine absence reaches this point. Events stored out of order are
+    // sorted into place by `assembleStream` and leave nothing to report.
     const catchingUp =
       blocked !== null && (blocked.kind === 'deferred' || blocked.kind === 'unavailable');
 
-    const assembled: Assembled = assembleStream(loaded);
-    // Withheld here, not forgotten: a jump in a range we have not finished
-    // fetching is re-tested on every poll, and becomes the fault above as soon
-    // as the range is complete.
-    const gapWithheld = catchingUp && assembled.gapAfterSeq !== null;
-    if (assembled.gapAfterSeq !== null && gap === null && !catchingUp) {
-      gap = { afterSeq: assembled.gapAfterSeq, reason: 'sequence-gap' };
+    const missing = assembled.missingSeqs;
+    if (missing.length > 0 && gap === null && !catchingUp) {
+      gap = { afterSeq: missing[0]! - 1, reason: 'sequence-gap', missing: missing.length };
     }
 
     const pending = blocked === null ? [] : rangeInclusive(blocked.n, head.chunkLast);
@@ -672,12 +680,7 @@ async function loadDetailNow(options: LoadDetailOptions = {}): Promise<void> {
     // `keptPrevious` is the case that most needs the sentence: nothing loaded,
     // so the roll above is holding older events. Without it that case would be
     // the one that stayed silent whenever the session has a single chunk.
-    //
-    // `gapWithheld` is the other: the timeline stops where the sequence jumped,
-    // and a fault about it is being withheld — so the reader must be told why
-    // the strip ends early rather than left to wonder.
-    detail.inFlight =
-      !resyncing && (keptPrevious || gapWithheld || (inFlight && pending.length > 1));
+    detail.inFlight = !resyncing && (keptPrevious || (inFlight && pending.length > 1));
     detail.pendingChunks = pending;
     detail.chunksLoaded = loaded.length;
     detail.chunksTotal = head.chunkLast - head.chunkFirst + 1;
@@ -743,6 +746,25 @@ function failureMessage(error: unknown): string {
   return 'The write failed.';
 }
 
+/**
+ * Whether the PC is accepting prompts at all.
+ *
+ * The open session's head is read first, because while a session is on screen
+ * the head is the only file polled: on a deep link or a reload the index was
+ * never fetched, so its copy of this flag is not stale but absent — and absent
+ * read as "off", which told the user prompts were disabled on a PC that had them
+ * on. The index remains the fallback for a bridge too old to publish the flag in
+ * the head.
+ *
+ * Fails closed at both levels. An explicit `false` from the head is the PC's own
+ * answer and is not overridden by a staler index.
+ */
+export function injectionEnabled(): boolean {
+  const fromHead = relay.detail?.head?.injectionEnabled;
+  if (fromHead !== undefined) return fromHead === true;
+  return relay.index?.injectionEnabled === true;
+}
+
 export async function sendPrompt(text: string): Promise<SendOutcome> {
   const sessionId = relay.activeSessionId;
   if (!sessionId) return { ok: false, error: 'No session is open.' };
@@ -754,7 +776,7 @@ export async function sendPrompt(text: string): Promise<SendOutcome> {
   if (detail.head?.controllable !== true) {
     return { ok: false, error: 'This session is read-only.' };
   }
-  if (relay.index?.injectionEnabled !== true) {
+  if (!injectionEnabled()) {
     return { ok: false, error: 'Prompts are turned off on the PC.' };
   }
   if (!isConfigured.value) return { ok: false, error: 'Configure the relay in Settings first.' };

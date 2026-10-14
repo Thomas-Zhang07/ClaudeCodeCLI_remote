@@ -3,7 +3,7 @@ import { computed } from 'vue';
 
 import { basename, formatDurationMs, formatUSD, relativeTime } from '@/lib/format';
 import { useNow } from '@/lib/now';
-import { relay } from '@/stores/relay';
+import { injectionEnabled, relay } from '@/stores/relay';
 
 import CostPanel from './CostPanel.vue';
 import PromptComposer from './PromptComposer.vue';
@@ -51,11 +51,12 @@ const lastEventAt = computed(() => detail.value?.summary.lastEventTs ?? null);
 const waiting = computed(() => head.value?.status === 'waiting');
 const controllable = computed(() => head.value?.controllable === true);
 /**
- * Strictly true only when the PC says so. An index written before the field
- * existed, or one that failed to parse, must not be read as permission.
+ * Strictly true only when the PC says so, and read from the session's own head
+ * before the index — a session opened directly has no index to consult. See
+ * `injectionEnabled` in the store.
  */
-const injectionEnabled = computed(() => relay.index?.injectionEnabled === true);
-const canWrite = computed(() => controllable.value && injectionEnabled.value);
+const canSend = computed(() => injectionEnabled());
+const canWrite = computed(() => controllable.value && canSend.value);
 
 const errorAttention = computed(() => {
   const attention = detail.value?.summary.latestAttention;
@@ -154,12 +155,17 @@ function toComposer(): void {
       </p>
     </section>
 
-    <!-- A hole that cannot be repaired by asking again. -->
+    <!-- A hole in the record. Everything either side of it is still shown, so
+         the cost is the missing events and not the rest of the session. -->
     <section v-else-if="detail?.gap" class="cond fault">
       <p class="cond-kind">stream gap</p>
-      <p class="cond-text">
-        The record jumps after event #{{ detail.gap.afterSeq }} ({{ detail.gap.reason }}). Later
-        events are withheld rather than shown out of order.
+      <p v-if="detail.gap.missing !== null" class="cond-text">
+        {{ detail.gap.missing === 1 ? 'One event is' : `${detail.gap.missing} events are` }} missing
+        from the record after event #{{ detail.gap.afterSeq }}. The strip marks the hole.
+      </p>
+      <p v-else class="cond-text">
+        A chunk after event #{{ detail.gap.afterSeq }} could not be read, so its events are missing
+        from the strip. Everything either side of the break is shown.
       </p>
     </section>
 
@@ -212,7 +218,6 @@ function toComposer(): void {
       v-if="detail"
       :events="detail.events"
       :now="now"
-      :gaps-after-seq="detail.gap ? detail.gap.afterSeq : null"
       :dropped-events="dropped"
     />
 
@@ -224,7 +229,7 @@ function toComposer(): void {
       id="composer"
       :session-id="props.sessionId"
       :controllable="controllable"
-      :injection-enabled="injectionEnabled"
+      :injection-enabled="canSend"
     />
   </div>
 </template>

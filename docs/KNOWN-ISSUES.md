@@ -5,7 +5,7 @@ honest on purpose: several of the bugs below were invisible to the test suite an
 only appeared when the code ran against real data, so the "why it was missed"
 column is as useful as the fix itself.
 
-Last updated: 2026-10-13 (after M3).
+Last updated: 2026-10-14 (after the out-of-order sequence fix, M7).
 
 ---
 
@@ -78,6 +78,14 @@ against 47 real chunks the largest event is 12.9 KB against a 20 KB bound, so it
 is unreachable for real content — but it is a new runtime failure mode where a
 documented bound previously was.
 
+**What a rejection costs, corrected.** This note originally stopped at the
+bridge, and that was the mistake. The reader treated any discontinuity as
+terminal, so a dropped event did not lose one event — it withheld every later
+event for the life of that session, and since a chunk is immutable no amount of
+polling brought them back. "Logged rather than silent" on the bridge was an
+outage on the phone. The reader no longer behaves that way (see *Fixed* below),
+which is what makes this a bounded loss rather than the thing it was.
+
 ### 22. The phone package has no test runner
 
 `packages/phone` is a standalone package with its own lockfile and no test
@@ -87,6 +95,30 @@ covered from the bridge side.
 
 **Status:** accepted gap. Adding vitest there means touching its lockfile, which
 was judged a worse trade than the gap.
+
+**Worse than it looked.** "Covered by typecheck" was not true either: the root
+`npm run typecheck` runs `--workspaces`, and `packages/phone` is not a workspace,
+so the phone was being skipped silently — the only thing checking it was
+`vite build`, which does not typecheck at all. The root script now runs both of
+the phone's passes (`vue-tsc` and its node-side `tsc`). Whether the phone asked
+to be covered by typecheck was moot while nothing was running it.
+
+### 23. The writer's ordering is pinned by pattern, not end to end
+
+`packages/bridge/test/queue.test.ts` asserts the invariant through a real
+`ChunkWriter`, but it drives the queue the way `Bridge` does rather than driving
+`Bridge` itself. The interleaving that caused the tear reached `#confirmDelivery`
+through prompt injection, which needs a live control pipe, a `ccr` registration
+and a relay — enough scaffolding that the test would be mostly scaffolding.
+
+**Consequence:** the queue is tested; its *use* is not. A future producer that
+wrote without going through `runtime.queue` would not fail a test — it would fail
+on someone's phone. That the reader is now robust to exactly this is the reason
+this is a gap rather than a bug.
+
+**Status:** open, accepted. Worth revisiting if a producer is ever added outside
+`#tickSession`, `#recordInjection` and `#recordAttention`, which are the three
+that hold the queue today.
 
 ### 4. ~~Inbound prompts are never consumed~~ — RESOLVED
 
@@ -262,15 +294,21 @@ A phone whose clock is off writes a file that is then rejected, and the UI shows
 **Status:** not implemented. Options: a clock-skew check against the server's
 `Date` header, or surfacing rejections more loudly.
 
-### 11. `controllable` does not mean injection is enabled
+### 11. ~~`controllable` does not mean injection is enabled~~ — RESOLVED
 
 The composer is enabled by `state.controllable`, but `CCR_ALLOW_INJECTION` also
 has to be on for a prompt to actually run. With it off, prompts are accepted into
 `in/` and never executed, and the UI honestly reports them as unacknowledged
 rather than explaining why.
 
-**Status:** the bridge should publish its injection policy in `index.json` so the
-phone can say so plainly.
+**Resolved** by publishing the policy in `head.json` as well as `index.json`.
+`index.json` alone was not enough, and the reason is structural rather than an
+oversight: the index is only read while *browsing*, and a session opened directly
+— a deep link, a reload — polls the head and nothing else. Its copy of the flag
+was therefore not stale but **absent**, and absent read as "off", so the composer
+told the user prompts were disabled on a PC that had them on. The head is the one
+file always polled for an open session, so the flag belongs there; the index
+stays as the fallback for a reader too old to look for it in the head.
 
 ### 12. Acknowledgement only resolves while the session is open
 
@@ -325,6 +363,37 @@ Each of these passed the unit suite and failed in reality.
 | Projected 1,669 duplicate `title` events | `ai-title` re-fires ~45 times per session. Only real data shows the volume. |
 | Subagents discovered once, never again | Only a session spawning a *later* agent exposes it. |
 | Agents rendered as a flat list | Nesting is `parentAgentId` in the meta file, not the directory layout or `spawnDepth`. |
+| **Every prompt sent from the phone tore the session's stream** | Two producers allocate sequence numbers on independent schedules. Every suite drove one producer at a time, so the interleaving only existed when the real bridge ran both. |
+| **The reader turned one hole into a whole-session outage** | No fixture could produce a discontinuity that was survivable, so the rule "withhold everything after a break" was only ever tested against breaks it was supposed to reject. |
+
+### The tear, and why it took the whole session with it
+
+Two defects, one visible and one not.
+
+A prompt typed into a session is acknowledged by writing an `injection` event,
+and that ran *inside* the loop appending a transcript line's events. A `user`
+line yields two events — a `user_prompt` and a `turn_start` — numbered 7 and 8
+before either is written, and confirming the delivery between them took 9 and
+wrote it first. The chunk read `… 7, 9, 8 …`. Every prompt sent from the phone
+did this and none typed at the PC, because only an injected prompt has a delivery
+to confirm.
+
+Underneath it sat the second defect. The reader required a gapless ascending
+sequence and withheld everything after the first break, so a mis-ordered pair did
+not cost an ordering — it hid the rest of the session, permanently, because a
+chunk is immutable and the same bytes produce the same verdict on every poll. The
+reply to that very prompt was sitting in the chunk, unshowable.
+
+Both are fixed, and the split is the point. The **writer** now keeps the ordering
+promise: one serialised queue per session, taking a sequence number and writing
+the event as a single step, with the delivery confirmation moved out of the
+append loop. The **reader** no longer depends on that promise: events are ordered
+by their own sequence numbers, so reordering is repaired rather than reported, and
+only genuine absence is. Either fix alone would have hidden the bug rather than
+fixed it — the writer's would leave every chunk already published broken, and the
+reader's would leave the record wrong. Only the reader's is retroactive, because
+nothing re-writes a sealed chunk.
+
 
 ### Verification mistakes worth remembering
 

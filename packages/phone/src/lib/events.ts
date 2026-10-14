@@ -14,9 +14,10 @@
  *    sentinel agree, which catches a truncated or duplicated chunk without any
  *    out-of-band digest.
  *
- * Sequence continuity is checked across chunks as before: a chunk whose events
- * do not continue the previous chunk's sequence is a real break, and everything
- * after it is withheld rather than rendered out of order.
+ * Sequence continuity is checked across chunks, but a discontinuity is no longer
+ * treated as terminal: the events are ordered by their own sequence numbers, so a
+ * chunk that stores them out of order assembles correctly, and only a sequence
+ * that is genuinely absent is reported as a hole. See `assembleStream`.
  */
 
 import type { ChunkEndSentinel, NormalizedEvent } from '@/types';
@@ -137,51 +138,62 @@ export interface LoadedChunk {
 
 export interface Assembled {
   events: NormalizedEvent[];
-  /** Number of events dropped as duplicates or out-of-order repeats. */
+  /** Events discarded because their sequence number was already present. */
   duplicatesDropped: number;
-  /** Set when the sequence jumps: the seq expected but never seen. */
-  gapAfterSeq: number | null;
-  /** Everything from the gap onward is withheld, so the UI can say so. */
-  truncatedAtGap: boolean;
+  /** Every sequence number missing between the first and last event assembled. */
+  missingSeqs: number[];
   lastSeq: number | null;
 }
 
 /**
- * Concatenate chunks, dropping anything that does not continue the sequence.
+ * Rebuild one ordered stream from the chunks that are present.
  *
- * Chunks are sorted by their `n`, not trusted in the order they arrived: with
- * parallel or caught-up fetches the arrival order means nothing.
+ * **Order is restored, not required.** A writer hands out sequence numbers and
+ * appends them on its own schedule, so a chunk can legitimately hold
+ * `… 7, 9, 8, 10 …`. Reading that as damage was wrong twice over: every event is
+ * there, and withholding everything after the break hid the whole rest of a
+ * session — permanently, since a chunk is immutable and the same bytes produce
+ * the same verdict on every poll.
+ *
+ * Sorting by sequence repairs the reordering and leaves only real absence to
+ * report, so a hole in the strip now means the record has one.
+ *
+ * Chunks are sorted by `n` because parallel fetches can land in any order, and
+ * the events are sorted for exactly the same reason one level down.
  */
 export function assembleStream(chunks: readonly LoadedChunk[]): Assembled {
   const ordered = [...chunks].sort((a, b) => a.n - b.n);
 
-  const events: NormalizedEvent[] = [];
+  const bySeq = new Map<number, NormalizedEvent>();
   let duplicatesDropped = 0;
-  let gapAfterSeq: number | null = null;
-  let lastSeq: number | null = null;
 
   for (const chunk of ordered) {
     for (const event of chunk.events) {
-      if (lastSeq !== null && event.seq <= lastSeq) {
+      // An event never changes within a generation, so a repeated sequence is
+      // the same event twice, not a revision of it.
+      if (bySeq.has(event.seq)) {
         duplicatesDropped++;
         continue;
       }
-      if (lastSeq !== null && event.seq !== lastSeq + 1) {
-        gapAfterSeq = lastSeq;
-        break;
-      }
-      events.push(event);
-      lastSeq = event.seq;
+      bySeq.set(event.seq, event);
     }
-    if (gapAfterSeq !== null) break;
+  }
+
+  const seqs = [...bySeq.keys()].sort((a, b) => a - b);
+  const missingSeqs: number[] = [];
+
+  for (let i = 1; i < seqs.length; i++) {
+    const previous = seqs[i - 1]!;
+    const current = seqs[i]!;
+    if (current <= previous + 1) continue;
+    for (let missing = previous + 1; missing < current; missing++) missingSeqs.push(missing);
   }
 
   return {
-    events,
+    events: seqs.map((seq) => bySeq.get(seq)!),
     duplicatesDropped,
-    gapAfterSeq,
-    truncatedAtGap: gapAfterSeq !== null,
-    lastSeq,
+    missingSeqs,
+    lastSeq: seqs.length > 0 ? seqs[seqs.length - 1]! : null,
   };
 }
 

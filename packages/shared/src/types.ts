@@ -271,6 +271,19 @@ export interface SessionHead extends SessionState {
    * only for compatibility.
    */
   generation?: string;
+  /**
+   * Whether the PC will accept prompts at all.
+   *
+   * Published to `head.json` as well as to `index.json`, because the head is the
+   * only file a reader polls while a session is open. A reader that goes straight
+   * into a session — a deep link, a reload — has never read the index, and
+   * without this could not tell "the PC refuses prompts" from "I have not
+   * asked", so it would have to say the former.
+   *
+   * Optional, and **absent means fall back to the index**: a reader must keep
+   * working against a bridge too old to publish it.
+   */
+  injectionEnabled?: boolean;
 }
 
 export interface CostState {

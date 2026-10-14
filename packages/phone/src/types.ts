@@ -119,6 +119,18 @@ export interface SessionHead {
    * exists for compatibility, nothing else.
    */
   generation?: string;
+  /**
+   * Whether the PC will accept prompts at all.
+   *
+   * It is in the head as well as in the index because the head is the only file
+   * polled while a session is open. Opening a session directly — a deep link or
+   * a reload — never loads the index, so without this the composer would report
+   * "prompts are off on the PC" about a relay that has them on.
+   *
+   * Absent on a head from a bridge too old to publish it, in which case the
+   * index remains the fallback.
+   */
+  injectionEnabled?: boolean;
 }
 
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'stopped';

@@ -19,6 +19,7 @@ import { join } from 'node:path';
 
 import {
   type AttentionLevel,
+  type EventDraft,
   type InjectionState,
   type NormalizedEvent,
   type RelayIndex,
@@ -57,6 +58,7 @@ import {
   scanProjects,
   type DiscoveredSession,
 } from './discovery.js';
+import { SerialQueue } from './queue.js';
 import { advanceLastMainKind, resumeSeq, SessionAggregator } from './session.js';
 import { Tailer, type TailState } from './tailer.js';
 
@@ -133,6 +135,15 @@ interface SessionRuntime {
   tailer: Tailer;
   aggregator: SessionAggregator;
   chunker: ChunkWriter;
+  /**
+   * Serialises everything that allocates a sequence number or appends a chunk.
+   *
+   * Sequencing lives in the aggregator, so "take the next number" and "write the
+   * event" have to happen as one step. Without this, an event recorded while a
+   * batch is being appended is written ahead of numbers already handed out to
+   * that batch — see `SerialQueue`.
+   */
+  queue: SerialQueue;
   agents: Map<string, AgentRuntime>;
   stateDirty: boolean;
   /** Agents appear throughout a session's life, so discovery is re-run. */
@@ -566,8 +577,12 @@ export class Bridge {
    * Comparison is on normalised text, with a long-prefix fallback because the
    * parser truncates long prompts — a truncation marker must not read as a
    * mismatch and leave a delivered prompt looking lost.
+   *
+   * **The caller must hold the session's queue**, since this writes an event.
+   * Callers are the append path, which holds it for the whole batch.
    */
-  async #confirmDelivery(sessionId: string, turnText: string): Promise<void> {
+  async #confirmDelivery(runtime: SessionRuntime, turnText: string): Promise<void> {
+    const sessionId = runtime.sessionId;
     let waiting = this.#awaitingDelivery.get(sessionId);
     if (!waiting || waiting.length === 0) return;
 
@@ -583,11 +598,39 @@ export class Bridge {
 
     const [arrived] = waiting.splice(index, 1);
     if (arrived) {
-      await this.#recordInjection(arrived.promptId, sessionId, 'delivered', 'reached the session');
+      await this.#writeSynthetic(runtime, {
+        ts: new Date().toISOString(),
+        sessionId,
+        agentId: null,
+        kind: 'injection',
+        promptId: arrived.promptId,
+        state: 'delivered',
+        detail: 'reached the session',
+      });
     }
   }
 
-  /** Surface a prompt's fate in the session timeline, so the phone sees it. */
+  /**
+   * Append one event the bridge originated rather than read from a transcript.
+   *
+   * **The caller must hold the session's queue.** Taking a sequence number and
+   * writing the event have to be one step, or a number taken here can be written
+   * ahead of one that was handed out earlier and is still on its way.
+   */
+  async #writeSynthetic(runtime: SessionRuntime, draft: EventDraft): Promise<void> {
+    const event = runtime.aggregator.record(draft);
+    await runtime.chunker.append(event);
+    this.#relayDirty = true;
+    runtime.stateDirty = true;
+  }
+
+  /**
+   * Surface a prompt's fate in the session timeline, so the phone sees it.
+   *
+   * Queued rather than written directly: this is called from the relay poll and
+   * from the hook receiver, both of which run on their own schedules and can
+   * otherwise land in the middle of a transcript batch.
+   */
   async #recordInjection(
     promptId: string,
     sessionId: string | null,
@@ -601,17 +644,17 @@ export class Bridge {
     const runtime = this.#sessions.get(sessionId);
     if (!runtime) return;
 
-    const event = runtime.aggregator.record({
-      ts: new Date().toISOString(),
-      sessionId,
-      agentId: null,
-      kind: 'injection',
-      promptId,
-      state,
-      detail,
-    });
-    await runtime.chunker.append(event);
-    this.#relayDirty = true;
+    await runtime.queue.run(() =>
+      this.#writeSynthetic(runtime, {
+        ts: new Date().toISOString(),
+        sessionId,
+        agentId: null,
+        kind: 'injection',
+        promptId,
+        state,
+        detail,
+      }),
+    );
   }
 
   /**
@@ -627,17 +670,19 @@ export class Bridge {
     text: string,
     level: AttentionLevel,
   ): Promise<void> {
-    const event = runtime.aggregator.record({
-      ts: new Date().toISOString(),
-      sessionId: runtime.sessionId,
-      agentId: null,
-      kind: 'attention',
-      text,
-      level,
-    });
-    await runtime.chunker.append(event);
+    // Queued: a hook arrives from the receiver's own HTTP handler, which is
+    // exactly the kind of caller that lands in the middle of a transcript batch.
+    await runtime.queue.run(() =>
+      this.#writeSynthetic(runtime, {
+        ts: new Date().toISOString(),
+        sessionId: runtime.sessionId,
+        agentId: null,
+        kind: 'attention',
+        text,
+        level,
+      }),
+    );
     runtime.stateDirty = true;
-    this.#relayDirty = true;
     // One of the few events worth a publish on its own — the phone is meant to
     // show this while the session sits there blocked.
     this.#schedulePublish();
@@ -847,6 +892,7 @@ export class Bridge {
       tailer,
       aggregator,
       chunker,
+      queue: new SerialQueue(),
       agents: new Map(),
       stateDirty: true,
       lastAgentScan: 0,
@@ -930,9 +976,15 @@ export class Bridge {
 
     const main = await runtime.tailer.poll();
     for (const line of main) {
-      const result = runtime.aggregator.ingest(line, null);
-      await this.#append(runtime, result.events);
-      if (result.stateDirty) runtime.stateDirty = true;
+      // Numbering and writing are one serialised step. `ingest` hands out a
+      // number for every event the line yields, and it appends them one at a
+      // time; a synthetic event recorded during one of those awaits would be
+      // written ahead of a number this batch already took.
+      await runtime.queue.run(async () => {
+        const result = runtime.aggregator.ingest(line, null);
+        await this.#append(runtime, result.events);
+        if (result.stateDirty) runtime.stateDirty = true;
+      });
     }
 
     for (const agent of runtime.agents.values()) {
@@ -941,9 +993,11 @@ export class Bridge {
         // Attribution matters: subagent transcripts carry the parent's
         // sessionId, so without the agent id these events would be
         // indistinguishable from the main thread's.
-        const result = runtime.aggregator.ingest(line, agent.agentId);
-        await this.#append(runtime, result.events, true);
-        if (result.stateDirty) runtime.stateDirty = true;
+        await runtime.queue.run(async () => {
+          const result = runtime.aggregator.ingest(line, agent.agentId);
+          await this.#append(runtime, result.events, true);
+          if (result.stateDirty) runtime.stateDirty = true;
+        });
       }
     }
 
@@ -954,17 +1008,24 @@ export class Bridge {
   }
 
   /**
-   * Write an event and decide whether it justifies a publish.
+   * Write a batch of already-sequenced events, and decide what to publish.
    *
-   * Only turn boundaries and attention signals do. Everything else accumulates
-   * locally until one of those arrives, which is what keeps pushes rare enough
-   * for the repository to stay small.
+   * Only turn boundaries and attention signals justify a publish. Everything else
+   * accumulates locally until one of those arrives, which is what keeps pushes
+   * rare enough for the repository to stay small.
+   *
+   * **The caller must hold the session's queue.** Every event here already
+   * carries a number handed out by `ingest`, so nothing else may append to this
+   * session's stream until the batch has been written.
    */
   async #append(
     runtime: SessionRuntime,
     events: readonly NormalizedEvent[],
     fromAgent = false,
   ): Promise<void> {
+    /** Prompts in this batch that need checking against what we typed. */
+    const arrived: string[] = [];
+
     for (const event of events) {
       try {
         await runtime.chunker.append(event);
@@ -988,12 +1049,13 @@ export class Bridge {
         // replay of yesterday's events must not look like activity now.
         const at = Date.parse(event.ts);
         if (Number.isFinite(at) && at > runtime.lastMainEventAt) runtime.lastMainEventAt = at;
+
+        // A prompt we typed has shown up as a turn, but confirming that takes
+        // the next sequence number — so it is collected here and recorded below,
+        // once the batch is whole.
+        if (event.kind === 'user_prompt') arrived.push(event.text);
       }
 
-      // A prompt we typed has shown up as a turn, so it genuinely arrived.
-      if (!fromAgent && event.kind === 'user_prompt') {
-        await this.#confirmDelivery(runtime.sessionId, event.text);
-      }
       this.#relayDirty = true;
       // Appending moves the chunk range, and `head.json` is what tells the
       // reader about it. Leaving this to the aggregator's own dirty flag would
@@ -1003,12 +1065,24 @@ export class Bridge {
       runtime.stateDirty = true;
       if (PUBLISH_TRIGGERS.has(event.kind)) this.#schedulePublish();
     }
+
+    // **After the batch, never inside it.** Recording a delivery allocates the
+    // next sequence number, and doing that between two events of this batch
+    // wrote it ahead of a number already handed out: a `user_prompt` at 7 and
+    // its `turn_start` at 8 came out as `7, 9, 8`, which the reader can only
+    // report as a tear. Every prompt sent from the phone produced one.
+    for (const text of arrived) await this.#confirmDelivery(runtime, text);
   }
 
   /** Write the per-session file the reader polls while a session is open. */
   async #writeHead(runtime: SessionRuntime): Promise<void> {
     const dir = join(this.#config.outDir, 'sessions', runtime.sessionId);
-    const head = buildSessionHead(runtime.aggregator.state, runtime.chunker.range, new Date());
+    const head = buildSessionHead({
+      state: runtime.aggregator.state,
+      range: runtime.chunker.range,
+      now: new Date(),
+      injectionEnabled: this.#config.allowInjection,
+    });
 
     await atomicWriteJson(join(dir, 'head.json'), head);
     await atomicWriteJson(join(dir, 'subagents.json'), runtime.aggregator.subagentTree());
@@ -1097,11 +1171,26 @@ export class Bridge {
  * an old one, is told the record has gone stale rather than left believing it
  * is live because Gitee answered.
  *
+ * `injectionEnabled` is here as well as in `index.json` because this is the only
+ * file a reader polls while a session is open. Without it, opening straight into
+ * a session — a deep link, a reload — leaves the reader with no index and no way
+ * to tell "the PC refuses prompts" from "I have not asked".
+ *
  * Pure and exported so the promise is testable: it is a contract between two
  * packages that do not share a build.
  */
-export function buildSessionHead(state: SessionState, range: ChunkRange, now: Date): SessionHead {
-  return { ...state, ...range, heartbeat: now.toISOString() };
+export function buildSessionHead(options: {
+  state: SessionState;
+  range: ChunkRange;
+  now: Date;
+  injectionEnabled: boolean;
+}): SessionHead {
+  return {
+    ...options.state,
+    ...options.range,
+    heartbeat: options.now.toISOString(),
+    injectionEnabled: options.injectionEnabled,
+  };
 }
 
 /** The contents of `index.json`, with the same heartbeat alongside `generatedAt`. */

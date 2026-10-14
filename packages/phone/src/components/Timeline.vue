@@ -10,7 +10,6 @@ import MarkdownText from './MarkdownText.vue';
 const props = defineProps<{
   events: NormalizedEvent[];
   now: number;
-  gapsAfterSeq: number | null;
   /** Events dropped by rolling retention, so the strip can say where it begins. */
   droppedEvents?: number;
 }>();
@@ -70,6 +69,31 @@ const slice = computed(() => visibleEvents.value.slice(-limit.value));
 const hiddenCount = computed(() => Math.max(0, visibleEvents.value.length - slice.value.length));
 
 /**
+ * Where the record itself is torn, keyed by the event it tears after.
+ *
+ * Derived from every event rather than from the rows, because the strip hides
+ * subagent traffic by default and a run of hidden events is not a hole —
+ * reading tears off the filtered list would draw one at every gap the filter
+ * made. The events arrive in sequence order, so adjacency is the test.
+ */
+const tears = computed(() => {
+  const marks = new Map<number, { first: number; count: number }>();
+  const all = props.events;
+
+  for (let i = 1; i < all.length; i++) {
+    const previous = all[i - 1]!;
+    const current = all[i]!;
+    if (current.seq <= previous.seq + 1) continue;
+    marks.set(previous.seq, {
+      first: previous.seq + 1,
+      count: current.seq - previous.seq - 1,
+    });
+  }
+
+  return marks;
+});
+
+/**
  * Entries, each knowing whether it carries a time mark.
  *
  * A timestamp on every line is noise; on none of them the strip cannot be read
@@ -87,7 +111,12 @@ const rows = computed(() => {
       index === list.length - 1 ||
       event.kind === 'turn_start' ||
       (at !== null && before !== null && at - before >= STAMP_GAP_MS);
-    return { event, stamp, key: `${event.agentId ?? 'main'}-${event.seq}` };
+    return {
+      event,
+      stamp,
+      tear: tears.value.get(event.seq) ?? null,
+      key: `${event.agentId ?? 'main'}-${event.seq}`,
+    };
   });
 });
 
@@ -238,13 +267,21 @@ function flags(event: NormalizedEvent): (string | null)[] {
           </div>
         </li>
 
-        <!-- A hole we cannot repair: the strip is torn, and the rule with it. -->
-        <li v-if="gapsAfterSeq !== null && row.event.seq === gapsAfterSeq" class="tear">
+        <!-- A hole in the record: the strip is torn, and the rule with it. -->
+        <li v-if="row.tear" class="tear">
           <span class="margin">
-            <span class="seq">{{ gapsAfterSeq + 1 }}</span>
+            <span class="seq">{{ row.tear.first }}</span>
           </span>
           <i class="tick" aria-hidden="true"></i>
-          <p>The strip is torn here: event #{{ gapsAfterSeq + 1 }} never arrived.</p>
+          <p>
+            <template v-if="row.tear.count === 1">
+              The strip is torn here: event #{{ row.tear.first }} never arrived.
+            </template>
+            <template v-else>
+              The strip is torn here: {{ row.tear.count }} events from
+              #{{ row.tear.first }} never arrived.
+            </template>
+          </p>
         </li>
       </template>
     </ol>

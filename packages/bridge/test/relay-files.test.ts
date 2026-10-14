@@ -53,14 +53,14 @@ const entry: SessionIndexEntry = {
 
 describe('buildSessionHead', () => {
   it('carries the writer’s clock, not the session’s', () => {
-    const head = buildSessionHead(state, range, NOW);
+    const head = buildSessionHead({ state, range, now: NOW, injectionEnabled: true });
     expect(head.heartbeat).toBe(NOW.toISOString());
     // The session has been idle since yesterday; the heartbeat must not.
     expect(head.heartbeat).not.toBe(head.updatedAt);
   });
 
   it('keeps everything the session itself reports', () => {
-    const head = buildSessionHead(state, range, NOW);
+    const head = buildSessionHead({ state, range, now: NOW, injectionEnabled: true });
     expect(head.sessionId).toBe('sess-1');
     expect(head.status).toBe('idle');
     expect(head.chunkLast).toBe(2);
@@ -71,8 +71,21 @@ describe('buildSessionHead', () => {
     // The phone keys its chunk cache by this, so a head that omitted it would
     // put every reader back on the weak path — serving cached chunks from a
     // series the bridge has since rebuilt.
-    const head = buildSessionHead(state, range, NOW);
+    const head = buildSessionHead({ state, range, now: NOW, injectionEnabled: true });
     expect(head.generation).toBe('9f2c41ab77de0135');
+  });
+
+  it('carries the injection policy, so an open session knows it can be written to', () => {
+    // The head is the only file polled while a session is open. A reader that
+    // opened straight into one — a deep link, a reload — has no index to learn
+    // this from, and without it reports "prompts are off on the PC" about a
+    // relay that has them on.
+    expect(buildSessionHead({ state, range, now: NOW, injectionEnabled: false }).injectionEnabled).toBe(
+      false,
+    );
+    expect(buildSessionHead({ state, range, now: NOW, injectionEnabled: true }).injectionEnabled).toBe(
+      true,
+    );
   });
 
   /**
@@ -96,17 +109,32 @@ describe('buildSessionHead', () => {
     await first.open('sess-1');
     await first.append(event);
     await first.finish();
-    const before = buildSessionHead(state, first.range, NOW);
+    const before = buildSessionHead({
+      state,
+      range: first.range,
+      now: NOW,
+      injectionEnabled: true,
+    });
 
     const restarted = new ChunkWriter({ dir });
     await restarted.open('sess-1');
-    const afterRestart = buildSessionHead(state, restarted.range, NOW);
+    const afterRestart = buildSessionHead({
+      state,
+      range: restarted.range,
+      now: NOW,
+      injectionEnabled: true,
+    });
     expect(afterRestart.generation).toBe(before.generation);
 
     await rm(dir, { recursive: true, force: true });
     const rebuilt = new ChunkWriter({ dir });
     await rebuilt.open('sess-1');
-    const afterRebuild = buildSessionHead(state, rebuilt.range, NOW);
+    const afterRebuild = buildSessionHead({
+      state,
+      range: rebuilt.range,
+      now: NOW,
+      injectionEnabled: true,
+    });
     expect(afterRebuild.generation).not.toBe(before.generation);
   });
 });
